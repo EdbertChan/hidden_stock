@@ -1,4 +1,4 @@
-"""End-to-end: deterministic 13F + 20-F/10-K notes → holdings rows."""
+"""End-to-end: 13F + Schedule 13D/G + 10-K/20-F/10-Q notes → holdings rows."""
 
 from __future__ import annotations
 
@@ -13,10 +13,12 @@ from .extract import (
     ownership_disclosure_slices,
     resolve_investee_ticker,
 )
-from .mtm import apply_gaap_and_adj, enrich_holding_mtm
-from .parse_13f import parse_13f_infotable_xml
+from .mtm import apply_gaap_and_adj
 from .parse_notes import parse_investment_notes
+from .parents import normalize_parent, uses_hk_aggregates
 from .schema import HOLDINGS_COLUMNS, empty_holding_row
+from .sec_13g import fetch_latest_13g_holdings
+from .sec_api_13f import latest_filer_13f_rows
 
 PARENT_CIK_OVERRIDES: dict[str, str] = {
     "TCEHY": "0001293451",
@@ -28,37 +30,77 @@ def _norm_key(row: dict) -> str:
     ticker = (row.get("investee_ticker") or "").strip().upper()
     if ticker:
         return f"t:{ticker}"
-    cusip = (row.get("_cusip") or "").strip().upper()
+    cusip = (row.get("_cusip") or row.get("cusip") or "").strip().upper()
     if cusip:
         return f"c:{cusip}"
     name = re.sub(r"[^a-z0-9]+", "", (row.get("investee_name") or "").lower())
     return f"n:{name}"
 
 
+def _is_13f_source(src: str) -> bool:
+    return src in {"13f", "sec_api_13f"} or str(src).startswith("13f") or str(src).startswith(
+        "sec_api_13f"
+    )
+
+
 def merge_raw_holdings(parts: list[list[dict]]) -> list[dict]:
-    """Dedupe by ticker/CUSIP/name; prefer 13F market fields when both exist."""
+    """Dedupe by ticker/CUSIP/name; prefer 13F market fields when both exist.
+
+    Collide on ticker so 13G cannot double-count a 13F name (AUR/GRAB). Map
+    disclosed fair value / carrying onto market_value when still null.
+    """
     merged: dict[str, dict] = {}
-    priority = {"13f": 3, "20f_note": 2, "10k_note": 2, "filing_note": 1, "13g": 2, "hk_annual": 1}
+    ticker_key: dict[str, str] = {}
+    priority = {
+        "13f": 3,
+        "sec_api_13f": 3,
+        "20f_note": 2,
+        "10k_note": 2,
+        "10q_note": 2,
+        "20f_investments_table": 2,
+        "10k_investments_table": 2,
+        "10q_investments_table": 2,
+        "investments_table": 2,
+        "filing_note": 1,
+        "13g": 2,
+        "hk_annual": 1,
+    }
+
+    def _apply_disclosed_fv(row: dict) -> None:
+        if row.get("market_value_usd") is None:
+            fv = row.get("fair_value_disclosed_usd")
+            if fv is None:
+                fv = row.get("carrying_usd")
+            if fv is not None:
+                row["market_value_usd"] = fv
 
     for group in parts:
         for raw in group:
             key = _norm_key(raw)
             if not key or key in {"t:", "c:", "n:"}:
                 continue
-            src = raw.get("_source") or ""
+            src = str(raw.get("_source") or "")
+            t = (raw.get("investee_ticker") or "").strip().upper()
+
+            # Ticker collision across different keys (13F CUSIP vs 13G ticker)
+            if t and t in ticker_key and ticker_key[t] != key:
+                key = ticker_key[t]
+
             prev = merged.get(key)
             if prev is None:
-                merged[key] = dict(raw)
+                row = dict(raw)
+                _apply_disclosed_fv(row)
+                merged[key] = row
+                if t:
+                    ticker_key[t] = key
                 continue
             out = dict(prev)
-            # Fill missing fields from new row
             for k, v in raw.items():
                 if v is None:
                     continue
                 if out.get(k) is None:
                     out[k] = v
-            # Prefer 13F for market/shares
-            if src == "13f":
+            if _is_13f_source(src):
                 for k in (
                     "shares_held",
                     "market_value_usd",
@@ -68,25 +110,61 @@ def merge_raw_holdings(parts: list[list[dict]]) -> list[dict]:
                     "price_source",
                     "price_as_of",
                     "_cusip",
+                    "cusip",
                 ):
                     if raw.get(k) is not None:
                         out[k] = raw[k]
-                out["_source"] = "13f+note" if (prev.get("_source") or "").endswith("note") else "13f"
+                prev_src = str(prev.get("_source") or "")
+                out["_source"] = f"{src}+{prev_src}" if prev_src and prev_src != src else src
                 note_prev = prev.get("note") or ""
                 out["note"] = f"{note_prev}; merged 13f".strip("; ")
             else:
-                # Prefer note ownership / carrying when 13F lacked them
-                for k in ("ownership_pct", "carrying_usd", "influence_disclosed", "filing_gaap_hint"):
+                for k in (
+                    "ownership_pct",
+                    "carrying_usd",
+                    "fair_value_disclosed_usd",
+                    "influence_disclosed",
+                    "filing_gaap_hint",
+                    "shares_held",
+                ):
                     if raw.get(k) is not None and out.get(k) is None:
                         out[k] = raw[k]
+                # Investments-table / note disclosed FV fills null 13G dollars
+                filled_disclosed_mv = False
+                if out.get("market_value_usd") is None:
+                    if raw.get("market_value_usd") is not None:
+                        out["market_value_usd"] = raw["market_value_usd"]
+                        filled_disclosed_mv = True
+                    elif raw.get("fair_value_disclosed_usd") is not None:
+                        out["market_value_usd"] = raw["fair_value_disclosed_usd"]
+                        filled_disclosed_mv = True
+                    elif raw.get("carrying_usd") is not None:
+                        out["market_value_usd"] = raw["carrying_usd"]
+                        filled_disclosed_mv = True
+                if filled_disclosed_mv and src:
+                    # 13G is identity only — stamp $ provenance onto _source/note
+                    prev_src = str(prev.get("_source") or "")
+                    if src not in prev_src.split("+"):
+                        out["_source"] = (
+                            f"{prev_src}+{src}" if prev_src and prev_src != src else src
+                        )
+                    note = str(out.get("note") or "")
+                    stamp = str(raw.get("note") or f"value_source={src}")
+                    if "investments_table" not in note and "value_source=" not in note:
+                        out["note"] = f"{note}; {stamp}".strip("; ") if note else stamp
                 if priority.get(src, 0) >= priority.get(str(prev.get("_source")), 0):
                     if raw.get("source_quote"):
                         out["source_quote"] = raw["source_quote"]
+            _apply_disclosed_fv(out)
             merged[key] = out
+            if t:
+                ticker_key[t] = key
     return list(merged.values())
 
 
 def _finalize_rows(raw_rows: list[dict], *, skip_eodhd_for_13f: bool = True) -> list[dict]:
+    """Finalize holdings. Never invent stake $ via EODHD for any source."""
+    _ = skip_eodhd_for_13f  # retained for call-site compatibility; invent path removed
     rows: list[dict] = []
     for raw in raw_rows:
         base = empty_holding_row()
@@ -100,13 +178,13 @@ def _finalize_rows(raw_rows: list[dict], *, skip_eodhd_for_13f: bool = True) -> 
                 "filing_gaap_hint",
             }:
                 base[k] = v
-        src = raw.get("_source") or ""
-        # 13F already has market value from the filing — skip network MTM.
-        if skip_eodhd_for_13f and src.startswith("13f") and base.get("market_value_usd") is not None:
-            enriched = apply_gaap_and_adj(base)
-        else:
-            enriched = enrich_holding_mtm(base, as_of=base.get("as_of_date"))
-        # Provenance in note
+        if base.get("market_value_usd") is None:
+            fv = base.get("fair_value_disclosed_usd")
+            if fv is None:
+                fv = base.get("carrying_usd")
+            if fv is not None:
+                base["market_value_usd"] = fv
+        enriched = apply_gaap_and_adj(base)
         if raw.get("_source") and enriched.get("note"):
             if f"source={raw['_source']}" not in str(enriched["note"]):
                 enriched["note"] = f"source={raw['_source']}; {enriched['note']}"
@@ -125,12 +203,12 @@ def process_parent_holdings(
     price: float | None = None,
     book_value: float | None = None,
     shares: float | None = None,
-    form_types: tuple[str, ...] = ("10-K", "20-F"),
+    form_types: tuple[str, ...] = ("10-K", "20-F", "10-Q"),
     use_llm_fallback: bool = False,
 ) -> tuple[list[dict], dict[str, Any]]:
-    """Return (holding_rows, meta). Deterministic 13F + annual notes by default."""
-    parent = parent_ticker.upper().replace(".", "-")
-    if parent in {"TCEHY", "TCTZF", "0700"}:
+    """Fan-out: 13F + Schedule 13D/G + annual/interim notes → merge."""
+    parent = normalize_parent(parent_ticker)
+    if uses_hk_aggregates(parent):
         from .tencent import build_tencent_holdings
 
         ua = getattr(edgar, "user_agent", None) or ""
@@ -144,8 +222,10 @@ def process_parent_holdings(
         "error": None,
         "num_raw": 0,
         "num_13f": 0,
+        "num_13g": 0,
         "num_notes": 0,
         "used_llm": False,
+        "sources": "13f+13g+notes",
     }
     cik = PARENT_CIK_OVERRIDES.get(parent) or edgar.get_cik(parent)
     if not cik:
@@ -154,38 +234,64 @@ def process_parent_holdings(
 
     aliases = load_investee_aliases()
     raw_13f: list[dict] = []
+    raw_13g: list[dict] = []
     raw_notes: list[dict] = []
 
-    # --- 13F (US-listed stakes) ---
-    f13 = edgar.get_latest_filing(cik, form_types=("13F-HR",), as_of=as_of)
-    if f13:
-        xml = edgar.fetch_13f_infotable(cik, f13["accession_no"])
-        if xml:
-            raw_13f = parse_13f_infotable_xml(
-                xml,
-                parent_ticker=parent,
-                accession_no=f13["accession_no"],
-                filing_date=f13["filing_date"],
-                aliases=aliases,
-            )
-            meta["num_13f"] = len(raw_13f)
-            meta["13f_accession"] = f13["accession_no"]
-            meta["13f_filing_date"] = f13["filing_date"]
+    # --- Form 13F ---
+    try:
+        raw_13f, f13_meta = latest_filer_13f_rows(
+            parent_ticker=parent, cik=cik, as_of=as_of
+        )
+        meta["num_13f"] = f13_meta.get("num_13f") or len(raw_13f)
+        meta["13f_accession"] = f13_meta.get("13f_accession")
+        meta["13f_filing_date"] = f13_meta.get("13f_filing_date")
+        meta["13f_period_end"] = f13_meta.get("13f_period_end")
+        if f13_meta.get("error") and not raw_13f:
+            meta["13f_error"] = f13_meta["error"]
+    except Exception as e:
+        meta["13f_error"] = str(e)
 
-    # --- Annual investment notes (scan recent 10-K/20-F so newer filings
-    # without a note do not hide Moonshot-style disclosures from prior year) ---
-    annual_types = tuple(t for t in form_types if t in {"10-K", "20-F"}) or ("10-K", "20-F")
-    annuals = edgar.list_filings(cik, form_types=annual_types, as_of=as_of, limit=3)
-    if not annuals:
-        annuals = edgar.list_filings(cik, form_types=("10-Q",), as_of=as_of, limit=1)
+    # --- Schedule 13D/G ---
+    try:
+        ua = getattr(edgar, "user_agent", None) or ""
+        raw_13g, g_meta = fetch_latest_13g_holdings(
+            cik=cik, parent_ticker=parent, user_agent=ua, max_filings=40
+        )
+        meta["num_13g"] = len(raw_13g)
+        meta["13g_filings_scanned"] = g_meta.get("num_filings_scanned")
+        if g_meta.get("error"):
+            meta["13g_error"] = g_meta["error"]
+    except Exception as e:
+        meta["13g_error"] = str(e)
+
+    # --- 10-K / 20-F / 10-Q notes ---
+    annual_types = tuple(t for t in form_types if t in {"10-K", "20-F", "10-Q"}) or (
+        "10-K",
+        "20-F",
+        "10-Q",
+    )
+    # Prefer annuals first, then a recent 10-Q
+    annuals = edgar.list_filings(
+        cik, form_types=tuple(t for t in annual_types if t != "10-Q") or ("10-K", "20-F"),
+        as_of=as_of,
+        limit=3,
+    )
+    if "10-Q" in annual_types:
+        qs = edgar.list_filings(cik, form_types=("10-Q",), as_of=as_of, limit=1)
+        annuals = list(annuals) + list(qs)
 
     filing = annuals[0] if annuals else None
     if filing:
         meta["accession_no"] = filing["accession_no"]
         meta["filing_date"] = filing["filing_date"]
+    elif meta.get("13f_accession"):
+        meta["accession_no"] = meta["13f_accession"]
+        meta["filing_date"] = meta.get("13f_filing_date")
 
     for ann in annuals:
-        html = edgar.fetch_filing_document(cik, ann["accession_no"], ann["primary_document"])
+        html = edgar.fetch_filing_document(
+            cik, ann["accession_no"], ann["primary_document"]
+        )
         text = edgar.get_filing_text(html, max_chars=1_200_000)
         part = parse_investment_notes(
             text,
@@ -196,14 +302,13 @@ def process_parent_holdings(
             aliases=aliases,
         )
         raw_notes.extend(part)
+
     meta["num_notes"] = len(raw_notes)
     meta["notes_filings_scanned"] = len(annuals)
 
-    merged = merge_raw_holdings([raw_13f, raw_notes])
+    merged = merge_raw_holdings([raw_13f, raw_13g, raw_notes])
     meta["num_raw"] = len(merged)
 
-    # Optional LLM fallback only when nothing deterministic found
-    text = ""
     if use_llm_fallback and not merged and filing and llm is not None:
         meta["used_llm"] = True
         html = edgar.fetch_filing_document(cik, filing["accession_no"], filing["primary_document"])
@@ -256,8 +361,8 @@ def process_parent_holdings(
                 }
             )
 
-    if not filing and not raw_13f:
-        meta["error"] = meta.get("error") or "no filing"
+    if not raw_13f and not raw_13g and not raw_notes:
+        meta["error"] = meta.get("error") or "no holdings from 13F/13G/notes"
 
     rows = _finalize_rows(merged)
     return rows, meta

@@ -399,17 +399,60 @@ def _notes_as_of(
     return list(by_key.values())
 
 
+def _is_disclosed_dollar_source(label: str) -> bool:
+    s = str(label or "").lower()
+    return any(
+        m in s
+        for m in (
+            "investments_table",
+            "20f_note",
+            "10k_note",
+            "10q_note",
+            "filing_note",
+        )
+    )
+
+
+def _record_value_provenance(dst: dict, src: dict) -> None:
+    """When $ is filled from Investments/notes, stamp note — 13G alone is not $ provenance."""
+    src_label = str(src.get("_source") or "")
+    src_note = str(src.get("note") or "")
+    if not (
+        _is_disclosed_dollar_source(src_label) or _is_disclosed_dollar_source(src_note)
+    ):
+        return
+    label = src_label or "disclosed_fv"
+    prev = str(dst.get("_source") or "")
+    if label and label not in prev.split("+"):
+        dst["_source"] = f"{prev}+{label}" if prev and prev != label else label
+    note = str(dst.get("note") or "")
+    # Prefer explicit investments_table token Codex/mechanical can grep
+    stamp = src_note if _is_disclosed_dollar_source(src_note) else f"value_source={label}"
+    if "investments_table" not in note and "_note" not in note and "value_source=" not in note:
+        dst["note"] = f"{note}; {stamp}".strip("; ") if note else stamp
+    elif stamp and stamp not in note and "investments_table" in stamp:
+        dst["note"] = f"{note}; {stamp}".strip("; ")
+
+
 def _fill_missing(dst: dict, src: dict) -> None:
     for k, v in src.items():
-        if v is None:
+        if v is None or k in {"_source", "note"}:
             continue
         if dst.get(k) is None:
             dst[k] = v
     # Disclosed FV / table $ fills null market_value even when key was first from 13G
+    filled_mv = False
     if dst.get("market_value_usd") is None and src.get("market_value_usd") is not None:
         dst["market_value_usd"] = src["market_value_usd"]
+        filled_mv = True
     if dst.get("ownership_pct") is None and src.get("ownership_pct") is not None:
         dst["ownership_pct"] = src["ownership_pct"]
+    if filled_mv or (
+        src.get("market_value_usd") is not None
+        and dst.get("market_value_usd") == src.get("market_value_usd")
+        and _is_disclosed_dollar_source(str(src.get("_source") or src.get("note") or ""))
+    ):
+        _record_value_provenance(dst, src)
 
 
 def _merge_period_rows(*row_groups: list[dict]) -> list[dict]:

@@ -11,7 +11,8 @@ from ..quirks.holdings import (
     HOLDINGS_COLUMNS,
     HISTORY_COLUMNS,
     PARENT_ROLLUP_COLUMNS,
-    build_13f_history,
+    build_holdings_history,
+    normalize_parent,
     process_parent_holdings,
     rollup_holdings,
 )
@@ -209,9 +210,9 @@ def equity_holdings(
     """Live path: extract holdings for allowlist and/or current P/B screen table.
 
     Does not hard-depend on ``screening_candidates`` so ``equity_holdings_job``
-    can run allowlist smoke (BABA / BRK.B / TCEHY) without materializing the
-    full live screen first. When no allowlist is set, loads
-    ``stock_data.price_book_screen`` if present.
+    can run allowlist smoke without materializing the full live screen first.
+    When no allowlist is set, loads ``stock_data.price_book_screen`` if present.
+    History/export assets require a non-empty ``ticker_allowlist``.
     """
     engine = db.get_engine()
     if config.ticker_allowlist:
@@ -260,20 +261,23 @@ def equity_holdings_history(
     edgar: dg.ResourceParam[EdgarResource],
     db: dg.ResourceParam[DBResource],
 ) -> pd.DataFrame:
-    """Quarter-over-quarter 13F positions: ticker, shares, buys/sells/exits, period_end."""
-    tickers = [t.upper().replace(".", "-") for t in (config.ticker_allowlist or ["BABA"])]
+    """Quarter-over-quarter positions (13F+notes or 13G/D reporter — strategy by parent)."""
+    if not config.ticker_allowlist:
+        raise dg.Failure(
+            "equity_holdings_history requires EquityHoldingsConfig.ticker_allowlist "
+            "(e.g. [\"BABA\"] or [\"TCEHY\"]); refusing BABA default"
+        )
+    tickers = [normalize_parent(t) for t in config.ticker_allowlist]
     all_rows: list[dict] = []
     for t in tickers:
-        if t in {"TCEHY", "TCTZF"}:
-            context.log.warning(f"{t}: no US 13F portfolio history; skip QoQ")
-            continue
-        rows, meta = build_13f_history(
+        rows, meta = build_holdings_history(
             parent_ticker=t,
             edgar=edgar,
             max_filings=int(config.history_max_filings),
         )
         context.log.info(
-            f"{t}: periods={meta.get('num_periods')} filings={meta.get('num_filings')} "
+            f"{t}: strategy={meta.get('strategy')} periods={meta.get('num_periods')} "
+            f"filings={meta.get('num_filings')} note_snaps={meta.get('num_note_snapshots')} "
             f"rows={len(rows)} err={meta.get('error')}"
         )
         all_rows.extend(rows)
@@ -296,6 +300,71 @@ def equity_holdings_history(
         }
     )
     return df
+
+
+@dg.asset(
+    group_name="equity_holdings",
+    deps=["equity_holdings", "equity_holdings_history"],
+)
+def equity_holdings_export(
+    context: dg.AssetExecutionContext,
+    config: EquityHoldingsConfig,
+    db: dg.ResourceParam[DBResource],
+) -> dict:
+    """Write CSV exports + Google Sheets tabs for each allowlisted parent."""
+    import os
+    from pathlib import Path
+
+    from ..quirks.holdings.export import (
+        load_current,
+        load_history,
+        push_google_sheets,
+        write_csvs,
+    )
+
+    if not config.ticker_allowlist:
+        raise dg.Failure(
+            "equity_holdings_export requires EquityHoldingsConfig.ticker_allowlist"
+        )
+    tickers = [normalize_parent(t) for t in config.ticker_allowlist]
+    out_dir = Path(os.environ.get("EQUITY_HOLDINGS_EXPORT_DIR", "exports"))
+    engine = db.get_engine()
+    results: list[dict] = []
+    for parent in tickers:
+        hold = load_current(parent, engine)
+        hist = load_history(parent, engine)
+        paths = write_csvs(parent, hold, hist, out_dir)
+        entry: dict = {
+            "parent": parent,
+            "num_current": len(hold),
+            "num_history": len(hist),
+            "csv": {k: str(v) for k, v in paths.items()},
+        }
+        try:
+            entry["sheets"] = push_google_sheets(
+                hold,
+                hist,
+                title=f"{parent} equity holdings",
+                create_new=True,
+            )
+        except Exception as e:
+            context.log.warning(f"{parent}: Sheets push skipped/failed: {e}")
+            entry["sheets_error"] = str(e)
+        results.append(entry)
+        context.log.info(
+            f"{parent}: csv={paths['portfolio']} rows_hist={len(hist)} "
+            f"sheets={entry.get('sheets', {}).get('url', entry.get('sheets_error', 'n/a'))}"
+        )
+    context.add_output_metadata(
+        {
+            "num_parents": len(results),
+            "export_dir": str(out_dir),
+            "spreadsheet_ids": [
+                r.get("sheets", {}).get("spreadsheet_id") for r in results if r.get("sheets")
+            ],
+        }
+    )
+    return {"exports": results}
 
 
 @dg.asset(group_name="backtest")

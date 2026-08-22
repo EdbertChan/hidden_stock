@@ -170,6 +170,36 @@ def mechanical_precheck(history_csv: Path, portfolio_csv: Path) -> dict:
         else:
             checks["no_otc_invent_marks"] = "pass"
 
+        # Non-null $ with only beneficial-ownership provenance = invent-or-mislabel
+        mv = pd.to_numeric(hist.get("market_value_usd"), errors="coerce")
+        notes = hist["note"].astype(str)
+        sole_13g = (
+            (mv.notna())
+            & (mv > 0)
+            & notes.str.contains(r"source=13g", case=False, regex=True, na=False)
+            & ~notes.str.contains(
+                r"investments_table|13f|value_source=|20f_note|10[kq]_note",
+                case=False,
+                regex=True,
+                na=False,
+            )
+        )
+        if sole_13g.any():
+            sample = hist.loc[
+                sole_13g, ["period_end", "investee_ticker", "market_value_usd", "note"]
+            ].head(5)
+            issues.append(
+                {
+                    "id": "beneficial_ownership_used_as_value_source",
+                    "severity": (
+                        "non-null market_value with only source=13g in note "
+                        "(13G is identity/%/shares — $ must cite 13F or Investments table)"
+                    ),
+                    "evidence": sample.to_dict(orient="records"),
+                }
+            )
+            checks["no_otc_invent_marks"] = "fail"
+
     return {
         "judge": "mechanical",
         "verdict": "fail" if issues else "pass",
@@ -511,6 +541,8 @@ def main() -> int:
     results: list[dict] = [mech]
 
     judges = [j.strip().lower() for j in args.judges.split(",") if j.strip()]
+    # mechanical always runs above; strip it from LLM pool
+    llm_judges = [j for j in judges if j != "mechanical"]
 
     def _run(name: str) -> dict:
         if name == "fable":
@@ -519,8 +551,8 @@ def main() -> int:
             return run_codex(packet_text, SCHEMA_PATH)
         raise ValueError(f"unknown judge {name}")
 
-    with ThreadPoolExecutor(max_workers=max(1, len(judges))) as pool:
-        futs = {pool.submit(_run, j): j for j in judges}
+    with ThreadPoolExecutor(max_workers=max(1, len(llm_judges))) as pool:
+        futs = {pool.submit(_run, j): j for j in llm_judges}
         for fut in as_completed(futs):
             name = futs[fut]
             try:

@@ -1,159 +1,88 @@
-"""Tencent Holdings (TCEHY): no US 20-F — use SEC 13G/D + HK annual aggregates."""
+"""Tencent Holdings (TCEHY): HK annual aggregates + SEC 13G/D (shared sec_13g)."""
 
 from __future__ import annotations
 
-import re
-import time
-from xml.etree import ElementTree as ET
-
-import requests
-
-from .mtm import enrich_holding_mtm
+from .mtm import apply_gaap_and_adj
 from .schema import HOLDINGS_COLUMNS, empty_holding_row
+from .sec_13g import (
+    ISSUER_TICKER_HINTS,
+    collect_13g_period_snapshots,
+    fetch_latest_13g_holdings,
+    resolve_issuer_ticker,
+)
 
 TENCENT_CIK = "0001293451"
-# Approximate USD/RMB for FY2024 year-end disclosures (HKEX annual report).
 RMB_PER_USD = 7.1884
 
-ISSUER_TICKER_HINTS = {
-    "kanzhun": "BZ",
-    "ke holdings": "BEKE",
-    "reddit": "RDDT",
-    "cango": "CANG",
-    "horizon quantum": None,
-    "pinduoduo": "PDD",
-    "pdd holdings": "PDD",
-    "sea limited": "SE",
-    "spotify": "SPOT",
-    "meituan": "3690.HK",
-    "vipshop": "VIPS",
-    "nio": "NIO",
-    "bilibili": "BILI",
-    "tencent music": "TME",
-    "huya": "HUYA",
-    "cheetah": "CMCM",
-    "global blue": "GB",
-    "cheche": "CCG",
-}
+# Re-export for tests that import from tencent
+__all__ = [
+    "TENCENT_CIK",
+    "ISSUER_TICKER_HINTS",
+    "resolve_issuer_ticker",
+    "fetch_tencent_13g_holdings",
+    "collect_13g_period_snapshots",
+    "build_13g_reporter_history",
+    "hk_annual_aggregate_rows",
+    "build_tencent_holdings",
+    "_13g_raw_to_position",
+]
 
 
-def _local(tag: str) -> str:
-    return tag.split("}")[-1]
+def _13g_raw_to_position(parsed: dict, *, form: str, acc: str, filing_date: str, cik: str):
+    """Test helper: map parsed dict → QoQ position (Tencent parent)."""
+    from .sec_13g import raw_to_position
+
+    return raw_to_position(
+        parsed,
+        parent_ticker="TCEHY",
+        form=form,
+        acc=acc,
+        filing_date=filing_date,
+        cik=cik,
+    )
 
 
-def _parse_13g_xml(xml_text: str) -> dict:
-    root = ET.fromstring(xml_text)
-    out: dict = {}
-    for el in root.iter():
-        name = _local(el.tag)
-        text = (el.text or "").strip()
-        if not text:
-            continue
-        key = name.lower()
-        if key in {"issuername", "nameofissuer"} and "issuer_name" not in out:
-            out["issuer_name"] = text
-        elif key in {"issuercusipnumber", "cusip"} and "cusip" not in out:
-            out["cusip"] = text
-        elif key in {"classpercent", "percentofclass"} and "ownership_pct" not in out:
-            try:
-                out["ownership_pct"] = float(re.sub(r"[^0-9.]", "", text.split()[0]))
-            except (TypeError, ValueError, IndexError):
-                pass
-        elif key in {"issuertradingsymbol", "tradingsymbol"} and "ticker" not in out:
-            out["ticker"] = text.upper()
-    return out
+def fetch_tencent_13g_holdings(*, user_agent: str, max_filings: int = 40) -> list[dict]:
+    rows, _meta = fetch_latest_13g_holdings(
+        cik=TENCENT_CIK,
+        parent_ticker="TCEHY",
+        user_agent=user_agent,
+        max_filings=max_filings,
+    )
+    return rows
 
 
-def fetch_tencent_13g_holdings(
+def build_13g_reporter_history(
     *,
+    parent_ticker: str = "TCEHY",
     user_agent: str,
-    max_filings: int = 40,
-) -> list[dict]:
-    """Latest Schedule 13G/D where Tencent is the reporting person → investee rows."""
-    session = requests.Session()
-    session.headers.update({"User-Agent": user_agent})
-    sub = session.get(f"https://data.sec.gov/submissions/CIK{TENCENT_CIK}.json", timeout=30)
-    sub.raise_for_status()
-    recent = sub.json()["filings"]["recent"]
-    forms_ok = {
-        "SC 13G",
-        "SC 13G/A",
-        "SC 13D",
-        "SC 13D/A",
-        "SCHEDULE 13G",
-        "SCHEDULE 13G/A",
-        "SCHEDULE 13D",
-        "SCHEDULE 13D/A",
-    }
+    max_filings: int = 80,
+) -> tuple[list[dict], dict]:
+    """QoQ history for Tencent Schedule 13G/D."""
+    from .history import diff_snapshots
+    from .parents import normalize_parent
 
-    by_issuer: dict[str, dict] = {}
-    n = 0
-    for i, form in enumerate(recent["form"]):
-        if form not in forms_ok:
-            continue
-        if n >= max_filings:
-            break
-        n += 1
-        acc = recent["accessionNumber"][i]
-        primary = recent["primaryDocument"][i]
-        # Prefer raw XML over xsl path
-        doc = primary.split("/")[-1] if primary else "primary_doc.xml"
-        if not doc.endswith(".xml"):
-            doc = "primary_doc.xml"
-        nodash = acc.replace("-", "")
-        url = f"https://www.sec.gov/Archives/edgar/data/{int(TENCENT_CIK)}/{nodash}/{doc}"
-        time.sleep(0.12)
-        try:
-            resp = session.get(url, timeout=20)
-            if resp.status_code != 200:
-                continue
-            parsed = _parse_13g_xml(resp.text)
-        except Exception:
-            continue
-        name = parsed.get("issuer_name")
-        if not name:
-            continue
-        key = name.strip().lower()
-        row = {
-            "investee_name": name,
-            "investee_ticker": parsed.get("ticker"),
-            "ownership_pct": parsed.get("ownership_pct"),
-            "as_of_date": recent["filingDate"][i],
-            "as_of_accession_no": acc,
-            "first_filing_date": recent["filingDate"][i],
-            "first_accession_no": acc,
-            "source_quote": f"{form} {acc}: {name} {parsed.get('ownership_pct')}%",
-            "confidence": "medium",
-            "note": f"Tencent Schedule 13 filing (CIK {TENCENT_CIK})",
-            "filing_gaap_hint": "fv_ni" if (parsed.get("ownership_pct") or 0) < 20 else None,
-            "influence_disclosed": bool((parsed.get("ownership_pct") or 0) >= 20),
-        }
-        # Keep newest filing per issuer name
-        prev = by_issuer.get(key)
-        if prev is None or str(row["as_of_date"]) >= str(prev["as_of_date"]):
-            by_issuer[key] = row
-
-    return list(by_issuer.values())
-
-
-def resolve_issuer_ticker(name: str | None, ticker: str | None) -> str | None:
-    if ticker:
-        return str(ticker).strip().upper()
-    if not name:
-        return None
-    key = name.strip().lower()
-    for alias, sym in ISSUER_TICKER_HINTS.items():
-        if alias in key:
-            return sym
-    return None
+    parent = normalize_parent(parent_ticker)
+    ordered, meta = collect_13g_period_snapshots(
+        cik=TENCENT_CIK,
+        parent_ticker=parent,
+        user_agent=user_agent,
+        max_filings=max_filings,
+    )
+    meta["parent_ticker"] = parent
+    meta["strategy"] = "fanout_13g_hk"
+    if meta.get("error"):
+        return [], meta
+    history = diff_snapshots(parent, ordered)
+    return history, meta
 
 
 def hk_annual_aggregate_rows(*, as_of: str = "2024-12-31") -> list[dict]:
     """FY2024 HK annual report aggregates (RMB → USD). Named investees not listed."""
-    listed_assoc_carrying_rmb = 149_557_000_000  # Note 22 listed associates carrying
-    listed_assoc_fv_rmb = 280_088_000_000  # fair value of stakes in listed associates
+    listed_assoc_carrying_rmb = 149_557_000_000
+    listed_assoc_fv_rmb = 280_088_000_000
     unlisted_assoc_carrying_rmb = 140_786_000_000
-    listed_investees_fv_rmb = 569_800_000_000  # all listed investees excl subsidiaries
+    listed_investees_fv_rmb = 569_800_000_000
     unlisted_investees_carrying_rmb = 335_600_000_000
 
     def usd(rmb: float) -> float:
@@ -177,6 +106,7 @@ def hk_annual_aggregate_rows(*, as_of: str = "2024-12-31") -> list[dict]:
             "confidence": "high",
             "note": "HKEX annual report aggregate; individual names not disclosed in Note 22",
             "price_source": "hk_annual_report_2024",
+            "_source": "hk_annual",
         },
         {
             "investee_name": "Unlisted associates (aggregate, HK annual report Note 22)",
@@ -190,6 +120,7 @@ def hk_annual_aggregate_rows(*, as_of: str = "2024-12-31") -> list[dict]:
             "confidence": "high",
             "note": "No observable market; lookthrough MTM unknown",
             "price_source": "hk_annual_report_2024",
+            "_source": "hk_annual",
         },
         {
             "investee_name": "All listed investees excl. subsidiaries (aggregate FV)",
@@ -204,6 +135,7 @@ def hk_annual_aggregate_rows(*, as_of: str = "2024-12-31") -> list[dict]:
             "confidence": "high",
             "note": "Includes FVPL/FVOCI + listed associates on attributable basis",
             "price_source": "hk_annual_report_2024",
+            "_source": "hk_annual",
         },
         {
             "investee_name": "Unlisted investees excl. subsidiaries (aggregate carrying)",
@@ -217,12 +149,13 @@ def hk_annual_aggregate_rows(*, as_of: str = "2024-12-31") -> list[dict]:
             "confidence": "high",
             "note": "No market; cannot invent MTM adj",
             "price_source": "hk_annual_report_2024",
+            "_source": "hk_annual",
         },
     ]
 
 
 def build_tencent_holdings(*, user_agent: str) -> tuple[list[dict], dict]:
-    """Combine HK aggregates + SEC 13G/D named US stakes."""
+    """Combine HK aggregates + SEC 13G/D named stakes."""
     meta = {
         "parent_ticker": "TCEHY",
         "cik": TENCENT_CIK,
@@ -268,12 +201,6 @@ def build_tencent_holdings(*, user_agent: str) -> tuple[list[dict], dict]:
         ):
             if k in raw:
                 base[k] = raw[k]
-        # Skip EODHD for aggregate synthetic rows (already have FV/carrying).
-        if raw.get("price_source") == "hk_annual_report_2024":
-            from .mtm import apply_gaap_and_adj
-
-            enriched = apply_gaap_and_adj(base)
-        else:
-            enriched = enrich_holding_mtm(base, as_of=base.get("as_of_date"))
+        enriched = apply_gaap_and_adj(base)
         rows.append({c: enriched.get(c) for c in HOLDINGS_COLUMNS})
     return rows, meta

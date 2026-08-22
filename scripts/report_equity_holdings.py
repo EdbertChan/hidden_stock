@@ -96,6 +96,7 @@ def _print_history(hist: pd.DataFrame) -> None:
 
 def _live(tickers: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     from hidden_stock.quirks.holdings import process_parent_holdings, rollup_holdings
+    from hidden_stock.quirks.holdings.parents import normalize_parent
     from hidden_stock.quirks.holdings.schema import HOLDINGS_COLUMNS
     from hidden_stock.resources.edgar_resource import EdgarResource
 
@@ -103,7 +104,7 @@ def _live(tickers: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     all_rows: list[dict] = []
     rolls: list[dict] = []
     for t in tickers:
-        parent = "BRK-B" if t.upper() in {"BRK.B", "BRKB", "BRK-B"} else t.upper()
+        parent = normalize_parent(t)
         rows, meta = process_parent_holdings(
             parent_ticker=parent, edgar=edgar, llm=None, use_llm_fallback=False
         )
@@ -137,16 +138,18 @@ def _live(tickers: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def _history(tickers: list[str]) -> pd.DataFrame:
-    from hidden_stock.quirks.holdings import HISTORY_COLUMNS, build_13f_history
+    from hidden_stock.quirks.holdings import HISTORY_COLUMNS, build_holdings_history
+    from hidden_stock.quirks.holdings.parents import normalize_parent
     from hidden_stock.resources.edgar_resource import EdgarResource
 
     edgar = EdgarResource(user_agent=os.environ["SEC_EDGAR_USER_AGENT"])
     all_rows: list[dict] = []
     for t in tickers:
-        parent = "BRK-B" if t.upper() in {"BRK.B", "BRKB", "BRK-B"} else t.upper()
-        rows, meta = build_13f_history(parent_ticker=parent, edgar=edgar, max_filings=40)
+        parent = normalize_parent(t)
+        rows, meta = build_holdings_history(parent_ticker=parent, edgar=edgar, max_filings=40)
         print(
-            f"history {parent}: periods={meta.get('num_periods')} rows={len(rows)} err={meta.get('error')}"
+            f"history {parent}: strategy={meta.get('strategy')} periods={meta.get('num_periods')} "
+            f"rows={len(rows)} err={meta.get('error')}"
         )
         all_rows.extend(rows)
     hist = (
@@ -162,11 +165,13 @@ def _history(tickers: list[str]) -> pd.DataFrame:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("tickers", nargs="*", default=["BABA"])
+    p.add_argument("tickers", nargs="+", help="Parent tickers or aliases (e.g. BABA TCEHY tencent)")
     p.add_argument("--live", action="store_true")
-    p.add_argument("--history", action="store_true", help="Build/print QoQ 13F history")
+    p.add_argument("--history", action="store_true", help="Build/print QoQ holdings history")
     args = p.parse_args()
-    tickers = [t.upper() for t in args.tickers]
+    from hidden_stock.quirks.holdings.parents import normalize_parent
+
+    tickers = [normalize_parent(t) for t in args.tickers]
 
     if args.live:
         hold, roll = _live(tickers)

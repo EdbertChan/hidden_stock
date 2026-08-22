@@ -17,11 +17,11 @@ class BacktestConfig(Config):
 
 
 class EquityHoldingsConfig(Config):
-    """Allowlist for smoke / acceptance (BABA, BRK.B, TCEHY). Empty = use price_book_screen."""
+    """Ticker allowlist drives history/export; empty allowlist = live screen path only."""
 
     ticker_allowlist: list[str] = []
     max_workers: int = 2
     # Deterministic 13F + note parsers are primary; LLM only if explicitly enabled.
     use_llm_fallback: bool = False
-    # QoQ 13F history backtest depth.
+    # QoQ history backtest depth (13F filings or 13G/D filings depending on strategy).
     history_max_filings: int = 40

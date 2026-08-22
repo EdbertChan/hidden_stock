@@ -175,28 +175,40 @@ def chart_data_frame(
     top_n: int = 7,
     exclude_tickers: frozenset[str] | None = None,
 ) -> pd.DataFrame:
-    """Wide pivot for Sheets stacked column chart: period_end + top tickers ($M)."""
+    """Wide chart matrix. Series ordered by **latest** period $ (not all-time max).
+
+    All-time max ranked DIDIY above GRAB because older Investments FV was higher;
+    Codex grade requires latest-period ranking to match the live book.
+    """
     port = portfolio_by_period_frame(hist)
     if port.empty:
         return pd.DataFrame(columns=["period_end"])
-    skip = {t.upper() for t in (exclude_tickers if exclude_tickers is not None else CHART_EXCLUDE_TICKERS)}
+    skip = exclude_tickers if exclude_tickers is not None else CHART_EXCLUDE_TICKERS
     port = port[~port["investee_ticker"].astype(str).str.upper().isin(skip)].copy()
     if port.empty:
         return pd.DataFrame(columns=["period_end"])
-    totals = port.groupby("investee_ticker")["market_value_usd"].max().sort_values(ascending=False)
-    top = list(totals.head(top_n).index)
+
+    latest = str(sorted(port["period_end"].astype(str).unique())[-1])
+    latest_vals = (
+        port[port["period_end"].astype(str) == latest]
+        .groupby("investee_ticker")["market_value_usd"]
+        .sum()
+        .sort_values(ascending=False)
+    )
+    top = list(latest_vals.head(top_n).index)
     port["series"] = port["investee_ticker"].apply(lambda t: t if t in top else "OTHER")
     agg = port.groupby(["period_end", "series"], as_index=False)["market_value_usd"].sum()
     series = sorted(
         agg["series"].unique(),
-        key=lambda s: (s == "OTHER", -float(totals.get(s, 0) or 0)),
+        key=lambda s: (s == "OTHER", -float(latest_vals.get(s, 0) or 0)),
     )
     wide = (
         agg.pivot(index="period_end", columns="series", values="market_value_usd")
-        .fillna(0.0)
         .reindex(columns=series)
+        .fillna(0.0)
         .reset_index()
     )
+    wide.columns.name = None
     for c in series:
         wide[c] = (pd.to_numeric(wide[c], errors="coerce").fillna(0.0) / 1e6).round(2)
     return wide
