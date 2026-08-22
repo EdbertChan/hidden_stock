@@ -19,6 +19,7 @@ from .assets import (
 from .jobs import celery_smoke_job, equity_holdings_job, full_pipeline_job
 from .resources.db_resource import DBResource
 from .resources.edgar_resource import EdgarResource
+from .resources.equity_holdings_settings import EquityHoldingsSettings
 from .resources.gemini_resource import GeminiResource
 from .resources.reconstitution_resource import ReconstitutionResource
 from .resources.universe_resource import UniverseResource
@@ -55,5 +56,6 @@ defs = dg.Definitions(
         "llm": GeminiResource(),
         "universe": UniverseResource(),
         "reconstitution": ReconstitutionResource(),
+        "equity_holdings_settings": EquityHoldingsSettings(),
     },
 )

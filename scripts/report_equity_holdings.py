@@ -146,7 +146,7 @@ def _history(tickers: list[str]) -> pd.DataFrame:
     all_rows: list[dict] = []
     for t in tickers:
         parent = normalize_parent(t)
-        rows, meta = build_holdings_history(parent_ticker=parent, edgar=edgar, max_filings=40)
+        rows, meta = build_holdings_history(parent_ticker=parent, edgar=edgar, max_filings=80, lookback_years=5)
         print(
             f"history {parent}: strategy={meta.get('strategy')} periods={meta.get('num_periods')} "
             f"rows={len(rows)} err={meta.get('error')}"

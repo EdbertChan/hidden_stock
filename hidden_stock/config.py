@@ -16,12 +16,13 @@ class BacktestConfig(Config):
     force_tickers: list[str] = ["SENEA"]
 
 
+# Equity holdings settings live on EquityHoldingsSettings (ConfigurableResource).
+# EquityHoldingsConfig kept as a deprecated alias for any leftover launch configs.
 class EquityHoldingsConfig(Config):
-    """Ticker allowlist drives history/export; empty allowlist = live screen path only."""
+    """Deprecated: use resources.equity_holdings_settings instead."""
 
     ticker_allowlist: list[str] = []
     max_workers: int = 2
-    # Deterministic 13F + note parsers are primary; LLM only if explicitly enabled.
     use_llm_fallback: bool = False
-    # QoQ history backtest depth (13F filings or 13G/D filings depending on strategy).
-    history_max_filings: int = 40
+    history_lookback_years: int = 5
+    history_max_filings: int = 80

@@ -21,6 +21,13 @@ SHEET_POSITIONS = "positions_qoq"
 SHEET_CURRENT = "current_holdings"
 SHEET_PORTFOLIO = "portfolio_by_period"
 SHEET_CHART = "chart_data"
+SHEET_RETURNS = "returns_by_period"
+SHEET_REALIZED = "realized_pnl_qoq"
+SHEET_HOLDING_RETURNS = "holding_returns"
+SHEET_REPORTED_VS_EST = "reported_vs_est"
+SHEET_RETURNS_CHART = "returns_chart"
+SHEET_REALIZED_CHART = "realized_chart"
+SHEET_REALIZED_BY_TICKER = "realized_by_ticker_chart"
 
 # 13F values that blow up the stacked chart (likely unit/parse artifacts).
 CHART_EXCLUDE_TICKERS = frozenset({"MRDB"})
@@ -32,6 +39,7 @@ POSITIONS_COLS = [
     "cusip",
     "action",
     "shares_held",
+    "ownership_pct",
     "shares_prev",
     "shares_delta",
     "market_value_usd",
@@ -39,6 +47,7 @@ POSITIONS_COLS = [
     "value_delta",
     "filing_date",
     "accession_no",
+    "filing_url",
     "first_seen_period",
     "exited_period",
     "note",
@@ -92,10 +101,20 @@ def refresh_current(parent: str, edgar: Any, *, engine: Engine | None = None) ->
 
 
 def refresh_history(
-    parent: str, edgar: Any, *, max_filings: int = 40, engine: Engine | None = None
+    parent: str,
+    edgar: Any,
+    *,
+    max_filings: int = 80,
+    lookback_years: int = 5,
+    engine: Engine | None = None,
 ) -> pd.DataFrame:
     eng = engine or engine_from_env()
-    rows, _meta = build_holdings_history(parent_ticker=parent, edgar=edgar, max_filings=max_filings)
+    rows, _meta = build_holdings_history(
+        parent_ticker=parent,
+        edgar=edgar,
+        max_filings=max_filings,
+        lookback_years=lookback_years,
+    )
     hist = pd.DataFrame(rows, columns=HISTORY_COLUMNS) if rows else pd.DataFrame(columns=HISTORY_COLUMNS)
     try:
         existing = pd.read_sql("SELECT * FROM stock_data.equity_holdings_history", eng)
@@ -134,8 +153,23 @@ def load_history(parent: str, engine: Engine | None = None) -> pd.DataFrame:
 def positions_qoq_frame(hist: pd.DataFrame) -> pd.DataFrame:
     if hist.empty:
         return pd.DataFrame(columns=POSITIONS_COLS)
-    cols = [c for c in POSITIONS_COLS if c in hist.columns]
-    out = hist[cols].copy()
+    from .edgar_urls import edgar_filing_index_url
+    from .runner import PARENT_CIK_OVERRIDES
+
+    _KNOWN_CIK = {"UBER": "0001543151", "BABA": "0001577552"}
+    records = hist.to_dict(orient="records")
+    for r in records:
+        url = r.get("filing_url")
+        if url and str(url) not in ("", "nan", "None"):
+            continue
+        parent = str(r.get("parent_ticker") or "").upper()
+        cik = PARENT_CIK_OVERRIDES.get(parent) or _KNOWN_CIK.get(parent)
+        r["filing_url"] = edgar_filing_index_url(cik, r.get("accession_no"))
+    out = pd.DataFrame(records)
+    for c in POSITIONS_COLS:
+        if c not in out.columns:
+            out[c] = None
+    out = out[POSITIONS_COLS]
     return out.sort_values(["period_end", "investee_ticker"], kind="mergesort").reset_index(drop=True)
 
 
@@ -172,13 +206,13 @@ def portfolio_by_period_frame(hist: pd.DataFrame) -> pd.DataFrame:
 def chart_data_frame(
     hist: pd.DataFrame,
     *,
-    top_n: int = 7,
+    top_n: int | None = None,
     exclude_tickers: frozenset[str] | None = None,
 ) -> pd.DataFrame:
-    """Wide chart matrix. Series ordered by **latest** period $ (not all-time max).
+    """Wide chart matrix. One column per investee ticker — never an OTHER bucket.
 
-    All-time max ranked DIDIY above GRAB because older Investments FV was higher;
-    Codex grade requires latest-period ranking to match the live book.
+    Series ordered by **latest** period $ (not all-time max). ``top_n`` if set
+    keeps only the top-N latest names and **omits** the rest (no rollup column).
     """
     port = portfolio_by_period_frame(hist)
     if port.empty:
@@ -195,15 +229,28 @@ def chart_data_frame(
         .sum()
         .sort_values(ascending=False)
     )
-    top = list(latest_vals.head(top_n).index)
-    port["series"] = port["investee_ticker"].apply(lambda t: t if t in top else "OTHER")
-    agg = port.groupby(["period_end", "series"], as_index=False)["market_value_usd"].sum()
-    series = sorted(
-        agg["series"].unique(),
-        key=lambda s: (s == "OTHER", -float(latest_vals.get(s, 0) or 0)),
+    if top_n is not None:
+        keep = set(latest_vals.head(int(top_n)).index)
+        port = port[port["investee_ticker"].isin(keep)].copy()
+        latest_vals = latest_vals.head(int(top_n))
+    series = list(latest_vals.index)
+    # Also include tickers that only appear in earlier periods (still real names)
+    earlier = [
+        t
+        for t in port["investee_ticker"].astype(str).unique()
+        if t and t.upper() != "NAN" and t not in series
+    ]
+    earlier.sort(
+        key=lambda t: -float(
+            port[port["investee_ticker"] == t]["market_value_usd"].max() or 0
+        )
     )
+    series = series + earlier
+    agg = port.groupby(["period_end", "investee_ticker"], as_index=False)[
+        "market_value_usd"
+    ].sum()
     wide = (
-        agg.pivot(index="period_end", columns="series", values="market_value_usd")
+        agg.pivot(index="period_end", columns="investee_ticker", values="market_value_usd")
         .reindex(columns=series)
         .fillna(0.0)
         .reset_index()
@@ -219,29 +266,90 @@ def write_csvs(
     hold: pd.DataFrame,
     hist: pd.DataFrame,
     out_dir: Path | str,
+    *,
+    lookback_start: str | None = None,
 ) -> dict[str, Path]:
     from .history import assert_unique_period_ticker
+    from .validate import assert_live_shares_held_sane, scrub_live_pct_as_shares
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     # Refuse to ship Sheets/CSV when QoQ history doubles a ticker in one period
     # (SERV exit+13G miss after AUR-only CI).
     if hist is not None and len(hist):
+        from .lookback import coalesce_period_ticker, normalize_ticker
+
+        # Stamp CUSIP/name → ticker and coalesce 13F+13G alias collisions before assert.
+        hist = hist.copy()
+        hist = pd.DataFrame(coalesce_period_ticker(hist.to_dict(orient="records")))
+        if "investee_ticker" in hist.columns:
+            hist["investee_ticker"] = hist["investee_ticker"].map(normalize_ticker)
         assert_unique_period_ticker(
             hist.to_dict(orient="records"),
             context=f"export/{parent}",
         )
+    if hold is not None and len(hold):
+        cleaned = scrub_live_pct_as_shares(hold.to_dict(orient="records"))
+        assert_live_shares_held_sane(cleaned, context=f"export/{parent}/current")
+        hold = pd.DataFrame(cleaned)
     slug = parent.lower().replace("-", "")
+
+    def _window(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty or not lookback_start or "period_end" not in df.columns:
+            return df
+        pe = df["period_end"].astype(str).str[:10]
+        return df[pe >= str(lookback_start)[:10]].copy()
+
+    # positions_qoq keeps inception backfill rows for first_seen / lot audit.
     positions = positions_qoq_frame(hist)
-    portfolio = portfolio_by_period_frame(hist)
+    # Chart + portfolio stay on the display window.
+    portfolio = portfolio_by_period_frame(_window(hist))
+    from .performance import performance_frames
+
+    # Lots/Dietz use full (inception-extended) history; display tabs window-filtered.
+    perf = performance_frames(
+        hist if hist is not None else pd.DataFrame(),
+        parent=parent,
+    )
+    returns_by_period = _window(perf["returns_by_period"])
+    returns_chart = _window(perf["returns_chart"])
+    from .performance import realized_by_ticker_chart_frame, realized_chart_frame
+
+    realized_chart = realized_chart_frame(returns_by_period)
+    realized_events = perf["realized_pnl_qoq"]
+    if (
+        lookback_start
+        and realized_events is not None
+        and not realized_events.empty
+        and "period_end" in realized_events.columns
+    ):
+        pe = realized_events["period_end"].astype(str).str[:10]
+        realized_events_win = realized_events[pe >= str(lookback_start)[:10]].copy()
+    else:
+        realized_events_win = realized_events
+    realized_by_ticker = realized_by_ticker_chart_frame(realized_events_win)
     paths = {
         "current": out / f"{slug}_equity_holdings.csv",
         "history": out / f"{slug}_equity_holdings_history.csv",
         "portfolio": out / f"{slug}_portfolio_by_period.csv",
+        "returns_by_period": out / f"{slug}_returns_by_period.csv",
+        "realized_pnl_qoq": out / f"{slug}_realized_pnl_qoq.csv",
+        "holding_returns": out / f"{slug}_holding_returns.csv",
+        "reported_vs_est": out / f"{slug}_reported_vs_est.csv",
+        "returns_chart": out / f"{slug}_returns_chart.csv",
+        "realized_chart": out / f"{slug}_realized_chart.csv",
+        "realized_by_ticker_chart": out / f"{slug}_realized_by_ticker_chart.csv",
     }
     hold.to_csv(paths["current"], index=False)
     positions.to_csv(paths["history"], index=False)
     portfolio.to_csv(paths["portfolio"], index=False)
+    returns_by_period.to_csv(paths["returns_by_period"], index=False)
+    perf["realized_pnl_qoq"].to_csv(paths["realized_pnl_qoq"], index=False)
+    perf["holding_returns"].to_csv(paths["holding_returns"], index=False)
+    perf["reported_vs_est"].to_csv(paths["reported_vs_est"], index=False)
+    returns_chart.to_csv(paths["returns_chart"], index=False)
+    realized_chart.to_csv(paths["realized_chart"], index=False)
+    realized_by_ticker.to_csv(paths["realized_by_ticker_chart"], index=False)
     return paths
 
 
@@ -440,6 +548,353 @@ def _upsert_qoq_stacked_chart(spreadsheet_id: str, gc, chart_df: pd.DataFrame) -
     ).execute()
 
 
+def _upsert_returns_combo_chart(
+    spreadsheet_id: str,
+    gc,
+    returns_chart_df: pd.DataFrame,
+    *,
+    cagr: float | None = None,
+    years: float | None = None,
+) -> None:
+    """Combo chart: QoQ Dietz % (columns) + cum growth index (line)."""
+    from .performance import linked_dietz_cagr
+
+    # Data rows only (exclude blank/CAGR footer) for series ranges
+    data = returns_chart_df[
+        returns_chart_df["period_end"].astype(str).str.match(r"^\d{4}-\d{2}-\d{2}", na=False)
+    ].copy()
+    if data.empty or len(data.columns) < 3:
+        return
+    from googleapiclient.discovery import build
+
+    creds = _gspread_credentials(gc)
+    svc = build("sheets", "v4", credentials=creds)
+    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    sheet_id = None
+    delete_reqs: list[dict] = []
+    for s in meta.get("sheets", []):
+        props = s.get("properties") or {}
+        if props.get("title") == SHEET_RETURNS_CHART:
+            sheet_id = props.get("sheetId")
+            for ch in s.get("charts") or []:
+                delete_reqs.append({"deleteEmbeddedObject": {"objectId": ch["chartId"]}})
+            break
+    if sheet_id is None:
+        return
+
+    # Header + data rows only (footer starts after blank)
+    nrows = len(data) + 1  # includes header row index 0
+    if cagr is None:
+        info = linked_dietz_cagr(
+            pd.DataFrame(
+                {
+                    "period_end": data["period_end"],
+                    "dietz_return": data["dietz_return_pct"].apply(
+                        lambda x: float(x) / 100.0 if x is not None and x == x else None
+                    ),
+                    "cum_dietz_growth": data["cum_growth_index"],
+                }
+            )
+        )
+        cagr = info.get("cagr")
+        years = info.get("years")
+    if cagr is not None and years is not None:
+        subtitle = (
+            f"CAGR {cagr * 100:.1f}% over {years:.2f}y (linked Dietz; estimated)"
+        )
+    else:
+        subtitle = "CAGR n/a (linked Dietz; estimated)"
+
+    add_req = {
+        "addChart": {
+            "chart": {
+                "spec": {
+                    "title": "Estimated QoQ Dietz return (%)",
+                    "subtitle": subtitle,
+                    "basicChart": {
+                        "chartType": "COMBO",
+                        "legendPosition": "BOTTOM_LEGEND",
+                        "headerCount": 1,
+                        "domains": [
+                            {
+                                "domain": {
+                                    "sourceRange": {
+                                        "sources": [
+                                            {
+                                                "sheetId": sheet_id,
+                                                "startRowIndex": 0,
+                                                "endRowIndex": nrows,
+                                                "startColumnIndex": 0,
+                                                "endColumnIndex": 1,
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        ],
+                        "series": [
+                            {
+                                "series": {
+                                    "sourceRange": {
+                                        "sources": [
+                                            {
+                                                "sheetId": sheet_id,
+                                                "startRowIndex": 0,
+                                                "endRowIndex": nrows,
+                                                "startColumnIndex": 1,
+                                                "endColumnIndex": 2,
+                                            }
+                                        ]
+                                    }
+                                },
+                                "targetAxis": "LEFT_AXIS",
+                                "type": "COLUMN",
+                            },
+                            {
+                                "series": {
+                                    "sourceRange": {
+                                        "sources": [
+                                            {
+                                                "sheetId": sheet_id,
+                                                "startRowIndex": 0,
+                                                "endRowIndex": nrows,
+                                                "startColumnIndex": 2,
+                                                "endColumnIndex": 3,
+                                            }
+                                        ]
+                                    }
+                                },
+                                "targetAxis": "RIGHT_AXIS",
+                                "type": "LINE",
+                            },
+                        ],
+                    },
+                },
+                "position": {
+                    "overlayPosition": {
+                        "anchorCell": {
+                            "sheetId": sheet_id,
+                            "rowIndex": 0,
+                            "columnIndex": 4,
+                        },
+                        "widthPixels": 900,
+                        "heightPixels": 480,
+                    }
+                },
+            }
+        }
+    }
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id, body={"requests": [*delete_reqs, add_req]}
+    ).execute()
+
+
+def _upsert_realized_combo_chart(
+    spreadsheet_id: str,
+    gc,
+    realized_chart_df: pd.DataFrame,
+) -> None:
+    """Combo chart: QoQ avg-cost realized ($M) columns + cum realized ($M) line."""
+    data = realized_chart_df[
+        realized_chart_df["period_end"].astype(str).str.match(r"^\d{4}-\d{2}-\d{2}", na=False)
+    ].copy()
+    if data.empty or len(data.columns) < 3:
+        return
+    from googleapiclient.discovery import build
+
+    creds = _gspread_credentials(gc)
+    svc = build("sheets", "v4", credentials=creds)
+    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    sheet_id = None
+    delete_reqs: list[dict] = []
+    for s in meta.get("sheets", []):
+        props = s.get("properties") or {}
+        if props.get("title") == SHEET_REALIZED_CHART:
+            sheet_id = props.get("sheetId")
+            for ch in s.get("charts") or []:
+                delete_reqs.append({"deleteEmbeddedObject": {"objectId": ch["chartId"]}})
+            break
+    if sheet_id is None:
+        return
+
+    nrows = len(data) + 1
+    add_req = {
+        "addChart": {
+            "chart": {
+                "spec": {
+                    "title": "Estimated avg-cost realized P&L ($M)",
+                    "subtitle": "QoQ disposal estimate + cumulative; not tax/GAAP",
+                    "basicChart": {
+                        "chartType": "COMBO",
+                        "legendPosition": "BOTTOM_LEGEND",
+                        "headerCount": 1,
+                        "domains": [
+                            {
+                                "domain": {
+                                    "sourceRange": {
+                                        "sources": [
+                                            {
+                                                "sheetId": sheet_id,
+                                                "startRowIndex": 0,
+                                                "endRowIndex": nrows,
+                                                "startColumnIndex": 0,
+                                                "endColumnIndex": 1,
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        ],
+                        "series": [
+                            {
+                                "series": {
+                                    "sourceRange": {
+                                        "sources": [
+                                            {
+                                                "sheetId": sheet_id,
+                                                "startRowIndex": 0,
+                                                "endRowIndex": nrows,
+                                                "startColumnIndex": 1,
+                                                "endColumnIndex": 2,
+                                            }
+                                        ]
+                                    }
+                                },
+                                "targetAxis": "LEFT_AXIS",
+                                "type": "COLUMN",
+                            },
+                            {
+                                "series": {
+                                    "sourceRange": {
+                                        "sources": [
+                                            {
+                                                "sheetId": sheet_id,
+                                                "startRowIndex": 0,
+                                                "endRowIndex": nrows,
+                                                "startColumnIndex": 2,
+                                                "endColumnIndex": 3,
+                                            }
+                                        ]
+                                    }
+                                },
+                                "targetAxis": "RIGHT_AXIS",
+                                "type": "LINE",
+                            },
+                        ],
+                    },
+                },
+                "position": {
+                    "overlayPosition": {
+                        "anchorCell": {
+                            "sheetId": sheet_id,
+                            "rowIndex": 0,
+                            "columnIndex": 4,
+                        },
+                        "widthPixels": 900,
+                        "heightPixels": 480,
+                    }
+                },
+            }
+        }
+    }
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id, body={"requests": [*delete_reqs, add_req]}
+    ).execute()
+
+
+def _upsert_realized_by_ticker_chart(
+    spreadsheet_id: str,
+    gc,
+    by_ticker_df: pd.DataFrame,
+) -> None:
+    """Column chart: investee ticker vs total estimated avg-cost realized ($M)."""
+    data = by_ticker_df.copy() if by_ticker_df is not None else pd.DataFrame()
+    if data.empty or len(data.columns) < 2:
+        return
+    from googleapiclient.discovery import build
+
+    creds = _gspread_credentials(gc)
+    svc = build("sheets", "v4", credentials=creds)
+    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    sheet_id = None
+    delete_reqs: list[dict] = []
+    for s in meta.get("sheets", []):
+        props = s.get("properties") or {}
+        if props.get("title") == SHEET_REALIZED_BY_TICKER:
+            sheet_id = props.get("sheetId")
+            for ch in s.get("charts") or []:
+                delete_reqs.append({"deleteEmbeddedObject": {"objectId": ch["chartId"]}})
+            break
+    if sheet_id is None:
+        return
+
+    nrows = len(data) + 1
+    add_req = {
+        "addChart": {
+            "chart": {
+                "spec": {
+                    "title": "Estimated realized P&L by ticker ($M)",
+                    "subtitle": "Avg-cost disposal sum in window; not tax/GAAP",
+                    "basicChart": {
+                        "chartType": "COLUMN",
+                        "legendPosition": "BOTTOM_LEGEND",
+                        "headerCount": 1,
+                        "domains": [
+                            {
+                                "domain": {
+                                    "sourceRange": {
+                                        "sources": [
+                                            {
+                                                "sheetId": sheet_id,
+                                                "startRowIndex": 0,
+                                                "endRowIndex": nrows,
+                                                "startColumnIndex": 0,
+                                                "endColumnIndex": 1,
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        ],
+                        "series": [
+                            {
+                                "series": {
+                                    "sourceRange": {
+                                        "sources": [
+                                            {
+                                                "sheetId": sheet_id,
+                                                "startRowIndex": 0,
+                                                "endRowIndex": nrows,
+                                                "startColumnIndex": 1,
+                                                "endColumnIndex": 2,
+                                            }
+                                        ]
+                                    }
+                                },
+                                "targetAxis": "LEFT_AXIS",
+                            }
+                        ],
+                    },
+                },
+                "position": {
+                    "overlayPosition": {
+                        "anchorCell": {
+                            "sheetId": sheet_id,
+                            "rowIndex": 0,
+                            "columnIndex": 3,
+                        },
+                        "widthPixels": 900,
+                        "heightPixels": 480,
+                    }
+                },
+            }
+        }
+    }
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id, body={"requests": [*delete_reqs, add_req]}
+    ).execute()
+
+
 def _create_spreadsheet(gc, title: str, *, folder_id: str | None = None):
     """Create a new spreadsheet; folder_id should be a Shared Drive folder for SAs."""
     if folder_id:
@@ -451,9 +906,11 @@ def push_google_sheets(
     hold: pd.DataFrame,
     hist: pd.DataFrame,
     *,
+    parent: str | None = None,
     spreadsheet_id: str | None = None,
     title: str = "equity holdings",
     create_new: bool | None = None,
+    lookback_start: str | None = None,
 ) -> dict[str, str]:
     """Write data tabs + stacked QoQ chart. By default creates a **new** spreadsheet each call.
 
@@ -501,17 +958,77 @@ def push_google_sheets(
         sh = gc.open_by_key(sid)
 
     positions = positions_qoq_frame(hist)
-    portfolio = portfolio_by_period_frame(hist)
-    chart = chart_data_frame(hist)
+
+    def _window(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty or not lookback_start or "period_end" not in df.columns:
+            return df
+        pe = df["period_end"].astype(str).str[:10]
+        return df[pe >= str(lookback_start)[:10]].copy()
+
+    windowed = _window(hist)
+    portfolio = portfolio_by_period_frame(windowed)
+    chart = chart_data_frame(windowed)
+    from .performance import (
+        linked_dietz_cagr,
+        performance_frames,
+        realized_by_ticker_chart_frame,
+        realized_chart_frame,
+    )
+
+    perf = performance_frames(hist, parent=parent)
+    returns_chart = _window(perf["returns_chart"])
+    returns_by_period = _window(perf["returns_by_period"])
+    realized_chart = realized_chart_frame(returns_by_period)
+    realized_events = perf["realized_pnl_qoq"]
+    if (
+        lookback_start
+        and realized_events is not None
+        and not realized_events.empty
+        and "period_end" in realized_events.columns
+    ):
+        pe = realized_events["period_end"].astype(str).str[:10]
+        realized_events_win = realized_events[pe >= str(lookback_start)[:10]].copy()
+    else:
+        realized_events_win = realized_events
+    realized_by_ticker = realized_by_ticker_chart_frame(realized_events_win)
     _replace_worksheet(sh, SHEET_POSITIONS, positions)
     _replace_worksheet(sh, SHEET_CURRENT, hold)
     _replace_worksheet(sh, SHEET_PORTFOLIO, portfolio)
     _replace_worksheet(sh, SHEET_CHART, chart)
+    _replace_worksheet(sh, SHEET_RETURNS, returns_by_period)
+    _replace_worksheet(sh, SHEET_REALIZED, perf["realized_pnl_qoq"])
+    _replace_worksheet(sh, SHEET_HOLDING_RETURNS, perf["holding_returns"])
+    _replace_worksheet(sh, SHEET_REPORTED_VS_EST, perf["reported_vs_est"])
+    _replace_worksheet(sh, SHEET_RETURNS_CHART, returns_chart)
+    _replace_worksheet(sh, SHEET_REALIZED_CHART, realized_chart)
+    _replace_worksheet(sh, SHEET_REALIZED_BY_TICKER, realized_by_ticker)
+    chart_ok = "true"
+    returns_chart_ok = "true"
+    realized_chart_ok = "true"
+    realized_by_ticker_ok = "true"
     try:
         _upsert_qoq_stacked_chart(sid, gc, chart)
-        chart_ok = "true"
     except Exception as e:
         chart_ok = f"false:{e}"
+    try:
+        cagr_info = linked_dietz_cagr(perf["returns_by_period"])
+        _upsert_returns_combo_chart(
+            sid,
+            gc,
+            returns_chart,
+            cagr=cagr_info.get("cagr"),
+            years=cagr_info.get("years"),
+        )
+    except Exception as e:
+        returns_chart_ok = f"false:{e}"
+    try:
+        _upsert_realized_combo_chart(sid, gc, realized_chart)
+    except Exception as e:
+        realized_chart_ok = f"false:{e}"
+    try:
+        _upsert_realized_by_ticker_chart(sid, gc, realized_by_ticker)
+    except Exception as e:
+        realized_by_ticker_ok = f"false:{e}"
 
     if created:
         try:
@@ -530,6 +1047,9 @@ def push_google_sheets(
         "created": str(created).lower(),
         "title": sh.title if hasattr(sh, "title") else title,
         "chart": chart_ok,
+        "returns_chart": returns_chart_ok,
+        "realized_chart": realized_chart_ok,
+        "realized_by_ticker_chart": realized_by_ticker_ok,
     }
 
 
@@ -538,7 +1058,8 @@ def export_parent(
     *,
     refresh: bool = True,
     history: bool = True,
-    max_filings: int = 40,
+    max_filings: int = 80,
+    lookback_years: int = 5,
     out_dir: Path | str = "exports",
     push_sheets: bool = True,
     spreadsheet_id: str | None = None,
@@ -554,16 +1075,27 @@ def export_parent(
 
             edgar = EdgarResource(user_agent=os.environ["SEC_EDGAR_USER_AGENT"])
     hold = refresh_current(parent, edgar, engine=eng) if refresh else load_current(parent, eng)
+    from .lookback import lookback_start_date
+
+    lookback_start = lookback_start_date(lookback_years=lookback_years)
     hist = (
-        refresh_history(parent, edgar, max_filings=max_filings, engine=eng)
+        refresh_history(
+            parent,
+            edgar,
+            max_filings=max_filings,
+            lookback_years=lookback_years,
+            engine=eng,
+        )
         if history
         else load_history(parent, eng)
     )
-    paths = write_csvs(parent, hold, hist, out_dir)
+    paths = write_csvs(parent, hold, hist, out_dir, lookback_start=lookback_start)
     result: dict[str, Any] = {
         "parent": parent,
         "num_current": len(hold),
         "num_history": len(hist),
+        "lookback_years": lookback_years,
+        "lookback_start": lookback_start,
         "csv": {k: str(v) for k, v in paths.items()},
     }
     if push_sheets:
@@ -571,9 +1103,11 @@ def export_parent(
             sheets = push_google_sheets(
                 hold,
                 hist,
+                parent=parent,
                 spreadsheet_id=spreadsheet_id,
                 title=f"{parent} equity holdings",
                 create_new=create_new,
+                lookback_start=lookback_start,
             )
             result["sheets"] = sheets
         except Exception as e:

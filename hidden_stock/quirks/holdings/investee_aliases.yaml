@@ -46,8 +46,25 @@ aliases:
   bilibili: BILI
   "bilibili inc": BILI
   "perfect corp": PERF
+  "perfect corp.": PERF
   baoyun: BZUN
   baozun: BZUN
+  "baozun inc": BZUN
+  "baozun inc.": BZUN
+  momo: MOMO
+  "momo inc": MOMO
+  "hello group": MOMO
+  "hello group inc": MOMO
+  "best inc": BEST
+  best: BEST
+  groupon: GRPN
+  "groupon, inc": GRPN
+  "groupon, inc.": GRPN
+  "smart share": EM
+  "smart share global": EM
+  "smart share global limited": EM
+  mariadb: MRDB
+  "mariadb plc": MRDB
   "moonshot": null
   "moonshot ai": null
   "moonshot ai ltd": null

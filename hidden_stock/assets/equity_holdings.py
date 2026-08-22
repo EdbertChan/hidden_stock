@@ -6,7 +6,6 @@ import dagster as dg
 import pandas as pd
 from sqlalchemy import text
 
-from ..config import EquityHoldingsConfig
 from ..quirks.holdings import (
     HOLDINGS_COLUMNS,
     HISTORY_COLUMNS,
@@ -16,8 +15,11 @@ from ..quirks.holdings import (
     process_parent_holdings,
     rollup_holdings,
 )
+from ..quirks.holdings.history import assert_unique_period_ticker
+from ..quirks.holdings.validate import assert_live_shares_held_sane, scrub_live_pct_as_shares
 from ..resources.db_resource import DBResource
 from ..resources.edgar_resource import EdgarResource
+from ..resources.equity_holdings_settings import EquityHoldingsSettings
 from ..resources.llm_protocol import FilingLLM
 
 TABLE = "equity_holdings"
@@ -27,9 +29,6 @@ HISTORY_TABLE = "equity_holdings_history"
 
 
 def _ensure_table(engine, table: str) -> None:
-    cols_sql = ",\n".join(f'"{c}" text' for c in HOLDINGS_COLUMNS)
-    # Widen numeric-ish columns as double precision via cast on write; keep flexible text OK.
-    # Prefer typed DDL for analytics columns:
     typed = {
         "ownership_pct": "double precision",
         "shares_held": "double precision",
@@ -63,7 +62,9 @@ def _ensure_table(engine, table: str) -> None:
 
 def _write_holdings(engine, table: str, rows: list[dict], replace_parents: list[str] | None = None) -> None:
     _ensure_table(engine, table)
-    df = pd.DataFrame(rows, columns=HOLDINGS_COLUMNS) if rows else pd.DataFrame(columns=HOLDINGS_COLUMNS)
+    cleaned = scrub_live_pct_as_shares(rows)
+    assert_live_shares_held_sane(cleaned, context=f"stock_data.{table}")
+    df = pd.DataFrame(cleaned, columns=HOLDINGS_COLUMNS) if cleaned else pd.DataFrame(columns=HOLDINGS_COLUMNS)
     with engine.begin() as conn:
         if replace_parents:
             conn.execute(
@@ -120,7 +121,7 @@ def _run_universe(
     edgar: EdgarResource,
     llm: FilingLLM,
     db: DBResource,
-    config: EquityHoldingsConfig,
+    settings: EquityHoldingsSettings,
     *,
     table: str,
     as_of_col: str | None,
@@ -131,8 +132,8 @@ def _run_universe(
     df = tickers_df.copy() if not tickers_df.empty else pd.DataFrame(
         columns=["ticker", "price", "book_value", "shares", "pb_ratio"]
     )
-    if config.ticker_allowlist:
-        df = _ensure_allowlist_rows(df, config.ticker_allowlist)
+    if settings.ticker_allowlist:
+        df = _ensure_allowlist_rows(df, settings.ticker_allowlist)
 
     if df.empty:
         return pd.DataFrame(columns=HOLDINGS_COLUMNS), pd.DataFrame(columns=["ticker", *PARENT_ROLLUP_COLUMNS])
@@ -159,7 +160,7 @@ def _run_universe(
             edgar=edgar,
             llm=llm,
             as_of=as_of,
-            use_llm_fallback=bool(getattr(config, "use_llm_fallback", False)),
+            use_llm_fallback=bool(settings.use_llm_fallback),
         )
         roll = rollup_holdings(rows, price=price, book_value_per_share=bvps, shares=shares)
         roll["ticker"] = ticker
@@ -168,7 +169,7 @@ def _run_universe(
         roll["extract_error"] = meta.get("error")
         return rows, roll, meta
 
-    with ThreadPoolExecutor(max_workers=max(1, int(config.max_workers))) as pool:
+    with ThreadPoolExecutor(max_workers=max(1, int(settings.max_workers))) as pool:
         futs = {pool.submit(_one, w): w[0] for w in work}
         for fut in as_completed(futs):
             ticker = futs[fut]
@@ -191,6 +192,8 @@ def _run_universe(
                 )
 
     parents = sorted({w[0] for w in work})
+    all_rows = scrub_live_pct_as_shares(all_rows)
+    assert_live_shares_held_sane(all_rows, context=f"equity_holdings/{table}")
     _write_holdings(db.get_engine(), table, all_rows, replace_parents=parents)
     roll_df = pd.DataFrame(rollups)
     return (
@@ -202,27 +205,27 @@ def _run_universe(
 @dg.asset(group_name="equity_holdings")
 def equity_holdings(
     context: dg.AssetExecutionContext,
-    config: EquityHoldingsConfig,
+    equity_holdings_settings: EquityHoldingsSettings,
     edgar: dg.ResourceParam[EdgarResource],
     llm: dg.ResourceParam[FilingLLM],
     db: dg.ResourceParam[DBResource],
 ) -> pd.DataFrame:
     """Live path: extract holdings for allowlist and/or current P/B screen table.
 
-    Does not hard-depend on ``screening_candidates`` so ``equity_holdings_job``
-    can run allowlist smoke without materializing the full live screen first.
-    When no allowlist is set, loads ``stock_data.price_book_screen`` if present.
-    History/export assets require a non-empty ``ticker_allowlist``.
+    Settings come from ``resources.equity_holdings_settings`` (shared across the job).
     """
+    settings = equity_holdings_settings
     engine = db.get_engine()
-    if config.ticker_allowlist:
+    if settings.ticker_allowlist:
         base = pd.DataFrame(columns=["ticker", "price", "book_value", "shares", "pb_ratio"])
     else:
         try:
             base = pd.read_sql("select * from stock_data.price_book_screen", engine)
         except Exception:
             base = pd.DataFrame(columns=["ticker", "price", "book_value", "shares", "pb_ratio"])
-            context.log.warning("price_book_screen missing; set ticker_allowlist on EquityHoldingsConfig")
+            context.log.warning(
+                "price_book_screen missing; set ticker_allowlist on equity_holdings_settings"
+            )
 
     holdings_df, roll_df = _run_universe(
         context,
@@ -230,20 +233,20 @@ def equity_holdings(
         edgar,
         llm,
         db,
-        config,
+        settings,
         table=TABLE,
         as_of_col=None,
         price_col="price",
         bvps_col="book_value",
         shares_col="shares",
     )
-    # Persist parent rollups for summary merge without recompute.
     if not roll_df.empty:
         roll_df.to_sql(PARENT_ROLLUP_TABLE, engine, schema="stock_data", if_exists="replace", index=False)
     context.add_output_metadata(
         {
             "num_holdings_rows": len(holdings_df),
             "num_parents": int(roll_df["ticker"].nunique()) if len(roll_df) else 0,
+            "lookback_years": int(settings.history_lookback_years),
             "num_with_book_adj": int(
                 (pd.to_numeric(roll_df.get("holdings_book_adj_usd"), errors="coerce").fillna(0) != 0).sum()
             )
@@ -257,31 +260,34 @@ def equity_holdings(
 @dg.asset(group_name="equity_holdings")
 def equity_holdings_history(
     context: dg.AssetExecutionContext,
-    config: EquityHoldingsConfig,
+    equity_holdings_settings: EquityHoldingsSettings,
     edgar: dg.ResourceParam[EdgarResource],
     db: dg.ResourceParam[DBResource],
 ) -> pd.DataFrame:
     """Quarter-over-quarter positions (13F+notes or 13G/D reporter — strategy by parent)."""
-    if not config.ticker_allowlist:
+    settings = equity_holdings_settings
+    if not settings.ticker_allowlist:
         raise dg.Failure(
-            "equity_holdings_history requires EquityHoldingsConfig.ticker_allowlist "
-            "(e.g. [\"BABA\"] or [\"TCEHY\"]); refusing BABA default"
+            "equity_holdings_history requires equity_holdings_settings.ticker_allowlist "
+            '(e.g. ["BABA"] or ["TCEHY"]); refusing default'
         )
-    tickers = [normalize_parent(t) for t in config.ticker_allowlist]
+    tickers = [normalize_parent(t) for t in settings.ticker_allowlist]
     all_rows: list[dict] = []
     for t in tickers:
         rows, meta = build_holdings_history(
             parent_ticker=t,
             edgar=edgar,
-            max_filings=int(config.history_max_filings),
+            max_filings=int(settings.history_max_filings),
+            lookback_years=int(settings.history_lookback_years),
         )
         context.log.info(
-            f"{t}: strategy={meta.get('strategy')} periods={meta.get('num_periods')} "
-            f"filings={meta.get('num_filings')} note_snaps={meta.get('num_note_snapshots')} "
-            f"rows={len(rows)} err={meta.get('error')}"
+            f"{t}: strategy={meta.get('strategy')} lookback={meta.get('lookback_start')} "
+            f"periods={meta.get('num_periods')} filings={meta.get('num_filings')} "
+            f"note_snaps={meta.get('num_note_snapshots')} rows={len(rows)} err={meta.get('error')}"
         )
         all_rows.extend(rows)
 
+    assert_unique_period_ticker(all_rows, context="equity_holdings_history")
     df = pd.DataFrame(all_rows, columns=HISTORY_COLUMNS) if all_rows else pd.DataFrame(columns=HISTORY_COLUMNS)
     engine = db.get_engine()
     df.to_sql(HISTORY_TABLE, engine, schema="stock_data", if_exists="replace", index=False)
@@ -297,6 +303,9 @@ def equity_holdings_history(
             "num_sells": sells,
             "num_buys_or_new": buys,
             "periods": int(df["period_end"].nunique()) if len(df) else 0,
+            "lookback_years": int(settings.history_lookback_years),
+            "period_min": str(df["period_end"].min()) if len(df) else None,
+            "period_max": str(df["period_end"].max()) if len(df) else None,
         }
     )
     return df
@@ -308,7 +317,7 @@ def equity_holdings_history(
 )
 def equity_holdings_export(
     context: dg.AssetExecutionContext,
-    config: EquityHoldingsConfig,
+    equity_holdings_settings: EquityHoldingsSettings,
     db: dg.ResourceParam[DBResource],
 ) -> dict:
     """Write CSV exports + Google Sheets tabs for each allowlisted parent."""
@@ -322,17 +331,20 @@ def equity_holdings_export(
         write_csvs,
     )
 
-    if not config.ticker_allowlist:
+    settings = equity_holdings_settings
+    if not settings.ticker_allowlist:
         raise dg.Failure(
-            "equity_holdings_export requires EquityHoldingsConfig.ticker_allowlist"
+            "equity_holdings_export requires equity_holdings_settings.ticker_allowlist"
         )
-    tickers = [normalize_parent(t) for t in config.ticker_allowlist]
+    tickers = [normalize_parent(t) for t in settings.ticker_allowlist]
     out_dir = Path(os.environ.get("EQUITY_HOLDINGS_EXPORT_DIR", "exports"))
     engine = db.get_engine()
     results: list[dict] = []
     for parent in tickers:
         hold = load_current(parent, engine)
         hist = load_history(parent, engine)
+        if len(hold):
+            hold = pd.DataFrame(scrub_live_pct_as_shares(hold.to_dict(orient="records")))
         paths = write_csvs(parent, hold, hist, out_dir)
         entry: dict = {
             "parent": parent,
@@ -344,6 +356,7 @@ def equity_holdings_export(
             entry["sheets"] = push_google_sheets(
                 hold,
                 hist,
+                parent=parent,
                 title=f"{parent} equity holdings",
                 create_new=True,
             )
@@ -359,6 +372,7 @@ def equity_holdings_export(
         {
             "num_parents": len(results),
             "export_dir": str(out_dir),
+            "lookback_years": int(settings.history_lookback_years),
             "spreadsheet_ids": [
                 r.get("sheets", {}).get("spreadsheet_id") for r in results if r.get("sheets")
             ],
@@ -371,15 +385,15 @@ def equity_holdings_export(
 def backtest_equity_holdings(
     context: dg.AssetExecutionContext,
     pb_crossing_events: pd.DataFrame,
-    config: EquityHoldingsConfig,
+    equity_holdings_settings: EquityHoldingsSettings,
     edgar: dg.ResourceParam[EdgarResource],
     llm: dg.ResourceParam[FilingLLM],
     db: dg.ResourceParam[DBResource],
 ) -> pd.DataFrame:
     """Backtest path: holdings as-of deletion / crossing inputs."""
+    settings = equity_holdings_settings
     src = pb_crossing_events.copy()
     if not src.empty:
-        # Prefer deletion_date as as-of; valuation from crossing.
         if "buy_price" in src.columns:
             src["price"] = src["buy_price"]
         if "bvps_at_crossing" in src.columns:
@@ -394,7 +408,7 @@ def backtest_equity_holdings(
         edgar,
         llm,
         db,
-        config,
+        settings,
         table=BACKTEST_TABLE,
         as_of_col="as_of",
         price_col="price",

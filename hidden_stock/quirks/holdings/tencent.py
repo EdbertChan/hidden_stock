@@ -57,6 +57,7 @@ def build_13g_reporter_history(
     parent_ticker: str = "TCEHY",
     user_agent: str,
     max_filings: int = 80,
+    lookback_start: str | None = None,
 ) -> tuple[list[dict], dict]:
     """QoQ history for Tencent Schedule 13G/D."""
     from .history import diff_snapshots
@@ -68,9 +69,11 @@ def build_13g_reporter_history(
         parent_ticker=parent,
         user_agent=user_agent,
         max_filings=max_filings,
+        lookback_start=lookback_start,
     )
     meta["parent_ticker"] = parent
     meta["strategy"] = "fanout_13g_hk"
+    meta["lookback_start"] = lookback_start
     if meta.get("error"):
         return [], meta
     history = diff_snapshots(parent, ordered)

@@ -37,6 +37,15 @@ ISSUER_TICKER_HINTS: dict[str, str | None] = {
     "weride": "WRD",
     "serve robotics": "SERV",
     "neutron holdings": None,  # Lime — private
+    "xpeng": "XPEV",
+    "perfect corp": "PERF",
+    "baozun": "BZUN",
+    "momo": "MOMO",
+    "hello group": "MOMO",
+    "groupon": "GRPN",
+    "smart share": "EM",
+    "mariadb": "MRDB",
+    "best inc": "BEST",
     "joby aviation": "JOBY",
     "marqeta": "MQ",
     "rivian": "RIVN",
@@ -80,6 +89,11 @@ def resolve_issuer_ticker(name: str | None, ticker: str | None) -> str | None:
         return str(ticker).strip().upper()
     if not name:
         return None
+    from .extract import load_investee_aliases, resolve_investee_ticker
+
+    resolved = resolve_investee_ticker(name, None, load_investee_aliases())
+    if resolved:
+        return resolved
     key = name.strip().lower()
     for alias, sym in ISSUER_TICKER_HINTS.items():
         if alias in key:
@@ -144,27 +158,36 @@ def parse_13g_html(html_text: str) -> dict:
     if m:
         out["cusip"] = m.group(1).upper()
 
+    # Optional colon: real SC 13G/A exits often print "Row (9) 0%" with no ":".
     m = re.search(
-        r"Percent of Class Represented by Amount in Row\s*\(\s*\d+\s*\)\s*:\s*"
+        r"Percent of Class Represented by Amount in Row\s*\(\s*\d+\s*\)\s*:?\s*"
         r"(?P<pct>\d+(?:\.\d+)?)\s*%",
         text,
         re.I,
     )
     if not m:
         m = re.search(
-            r"Percent of Class Represented[^:]{0,80}:\s*(?P<pct>\d+(?:\.\d+)?)\s*%",
+            r"Percent of Class Represented[^0-9%]{0,80}:?\s*(?P<pct>\d+(?:\.\d+)?)\s*%",
             text,
             re.I,
         )
     if m:
         out["ownership_pct"] = float(m.group("pct"))
 
+    # Allow Aggregate Amount 0 (exit). Take the first numeric token after the label
+    # so "...Person 0 10 Check Box" yields 0, not row number 10.
     m = re.search(
-        r"(?:Aggregate Amount Beneficially Owned by Each Reporting Person|Sole Voting Power)"
-        r"[^0-9]{0,40}(?P<sh>[\d,]{4,})",
+        r"Aggregate Amount Beneficially Owned by Each Reporting Person"
+        r"[^0-9]{0,40}(?P<sh>[\d,]+)",
         text,
         re.I,
     )
+    if not m:
+        m = re.search(
+            r"Sole Voting Power[^0-9]{0,40}(?P<sh>[\d,]{4,})",
+            text,
+            re.I,
+        )
     if m:
         try:
             out["shares"] = float(m.group("sh").replace(",", ""))
@@ -174,6 +197,24 @@ def parse_13g_html(html_text: str) -> dict:
     m = re.search(r"Trading Symbol[^A-Z]{0,20}(?P<sym>[A-Z]{1,6})\b", text)
     if m:
         out["ticker"] = m.group("sym")
+
+    # Cessation / exit: 0%/0 shares, Item 5 language, or Item 4 "no longer owns".
+    pct = out.get("ownership_pct")
+    shares = out.get("shares")
+    cessation = bool(
+        re.search(
+            r"ceased to be the beneficial owner of more than five percent",
+            text,
+            re.I,
+        )
+        or re.search(
+            r"no longer owns?\s+any|no longer beneficial owners?",
+            text,
+            re.I,
+        )
+    )
+    if cessation or (pct is not None and float(pct) <= 0) or (shares is not None and float(shares) <= 0):
+        out["exit"] = True
 
     return out
 
@@ -230,7 +271,8 @@ def raw_to_live_row(
         "investee_name": name,
         "investee_ticker": ticker,
         "ownership_pct": pct,
-        "shares_held": float(shares) if shares is not None else (float(pct) if pct is not None else None),
+        # Never stuff ownership_% into shares_held — that shipped Neutron at 22.87 "shares".
+        "shares_held": float(shares) if shares is not None else None,
         "carrying_usd": None,
         "market_value_usd": None,
         "as_of_date": filing_date,
@@ -257,7 +299,11 @@ def raw_to_position(
     filing_date: str,
     cik: str,
 ) -> dict | None:
-    """QoQ snapshot row shape."""
+    """QoQ snapshot row shape.
+
+    Never invent ``shares_proxy=presence``. Shares are: parsed count, ownership_%
+    QoQ proxy, 0 on exit, or the row is dropped (identity-only garbage).
+    """
     live = raw_to_live_row(
         parsed,
         parent_ticker=parent_ticker,
@@ -270,17 +316,41 @@ def raw_to_position(
         return None
     pct = live.get("ownership_pct")
     shares = live.get("shares_held")
-    if shares is None:
-        shares = float(pct) if pct is not None else 1.0
+    note = str(live.get("note") or "")
+    is_exit = bool(parsed.get("exit")) or (
+        pct is not None and float(pct) <= 0
+    ) or (shares is not None and float(shares) <= 0)
+
+    # Never write ownership_% into shares_held (Neutron / EM / ANT class).
+    # QoQ continuity uses ownership_pct via diff_snapshots._continuity_qty.
+    if shares is None and pct is not None and not is_exit:
+        if "qoq_continuity=ownership_pct" not in note:
+            note = f"{note}; qoq_continuity=ownership_pct".strip("; ")
+    elif shares is None and is_exit:
+        shares = 0.0
+        pct = 0.0 if pct is None else pct
+        if "13g_exit=1" not in note:
+            note = f"{note}; 13g_exit=1".strip("; ")
+    elif shares is None:
+        # No quantitative signal and not an exit — do not invent presence=1.
+        return None
+
+    if is_exit:
+        shares = 0.0
+        if pct is None:
+            pct = 0.0
+        if "13g_exit=1" not in note:
+            note = f"{note}; 13g_exit=1".strip("; ")
+
     return {
         "investee_name": live["investee_name"],
         "investee_ticker": live.get("investee_ticker"),
-        "shares_held": float(shares),
+        "shares_held": float(shares) if shares is not None else None,
         "market_value_usd": None,
         "_cusip": live.get("_cusip"),
         "cusip": live.get("cusip"),
         "ownership_pct": pct,
-        "note": live.get("note"),
+        "note": note,
         "_source": "13g",
         "as_of_date": filing_date,
         "as_of_accession_no": acc,
@@ -375,6 +445,8 @@ def fetch_latest_13g_holdings(
 
     meta["num_filings_scanned"] = len(items)
     by_issuer: dict[str, dict] = {}
+    # Newest-first scan: once an issuer exits, ignore older filings that would re-add it.
+    exited_issuers: set[str] = set()
     for filing_date, form, acc, primary in items:
         time.sleep(0.08)
         body, kind = fetch_filing_text(session, cik, acc, primary)
@@ -396,6 +468,21 @@ def fetch_latest_13g_holdings(
         if not row:
             continue
         key = (row.get("investee_name") or "").strip().lower()
+        ticker = (row.get("investee_ticker") or "").strip().upper()
+        exit_keys = {k for k in (key, ticker.lower() if ticker else "") if k}
+        # Cessation amendments: drop issuer and block older re-adds.
+        if parsed.get("exit") or (
+            row.get("ownership_pct") is not None and float(row["ownership_pct"]) <= 0
+        ) or (row.get("shares_held") is not None and float(row["shares_held"]) <= 0):
+            exited_issuers |= exit_keys
+            by_issuer.pop(key, None)
+            if ticker:
+                for k, v in list(by_issuer.items()):
+                    if (v.get("investee_ticker") or "").strip().upper() == ticker:
+                        by_issuer.pop(k, None)
+            continue
+        if key in exited_issuers or (ticker and ticker.lower() in exited_issuers):
+            continue
         prev = by_issuer.get(key)
         if prev is None or str(row["as_of_date"]) >= str(prev["as_of_date"]):
             by_issuer[key] = row
@@ -408,9 +495,11 @@ def collect_13g_period_snapshots(
     parent_ticker: str,
     user_agent: str,
     max_filings: int = 80,
+    lookback_start: str | None = None,
 ) -> tuple[list[tuple[str, str, str, list[dict]]], dict[str, Any]]:
     """Oldest→newest running issuer map from Schedule 13D/G amendments."""
     from .history import _key
+    from .lookback import date_on_or_after
 
     meta: dict[str, Any] = {
         "num_filings": 0,
@@ -418,6 +507,7 @@ def collect_13g_period_snapshots(
         "error": None,
         "cik": cik,
         "parent_ticker": parent_ticker,
+        "lookback_start": lookback_start,
     }
     session = requests.Session()
     session.headers.update({"User-Agent": user_agent or "hidden_stock research"})
@@ -427,10 +517,15 @@ def collect_13g_period_snapshots(
         meta["error"] = str(e)
         return [], meta
 
+    if lookback_start:
+        items = [it for it in items if date_on_or_after(it[0], lookback_start)]
+
     items = list(reversed(items))
     meta["num_filings"] = len(items)
 
     running: dict[str, dict] = {}
+    exited_tickers: set[str] = set()
+    exited_by_date: dict[str, list[str]] = {}
     by_period: dict[str, tuple[str, str, str, list[dict]]] = {}
 
     for filing_date, form, acc, primary in items:
@@ -453,11 +548,24 @@ def collect_13g_period_snapshots(
         if not pos:
             continue
         pct = pos.get("ownership_pct")
+        shares = pos.get("shares_held")
+        note = str(pos.get("note") or "")
         k = _key(pos)
-        if pct is not None and float(pct) <= 0:
+        ticker = (pos.get("investee_ticker") or "").strip().upper()
+        is_exit = (
+            "13g_exit=1" in note
+            or (pct is not None and float(pct) <= 0)
+            or (shares is not None and float(shares) <= 0)
+        )
+        if is_exit:
             running.pop(k, None)
+            if ticker:
+                exited_tickers.add(ticker)
         else:
             running[k] = pos
+            if ticker:
+                exited_tickers.discard(ticker)
+        exited_by_date[filing_date] = sorted(exited_tickers)
         by_period[filing_date] = (
             filing_date,
             filing_date,
@@ -467,7 +575,23 @@ def collect_13g_period_snapshots(
 
     ordered = [by_period[k] for k in sorted(by_period.keys())]
     meta["num_periods"] = len(ordered)
+    meta["exited_by_date"] = exited_by_date
     return ordered, meta
+
+
+def exited_tickers_as_of(
+    exited_by_date: dict[str, list[str]] | None,
+    as_of: str,
+) -> set[str]:
+    """Cumulative 13G/D exit tickers with filing_date <= as_of."""
+    if not exited_by_date:
+        return set()
+    best: set[str] = set()
+    as_of_s = str(as_of or "")[:10]
+    for d in sorted(exited_by_date.keys()):
+        if str(d)[:10] <= as_of_s:
+            best = {t.upper() for t in exited_by_date[d] if t}
+    return best
 
 
 def positions_as_of(

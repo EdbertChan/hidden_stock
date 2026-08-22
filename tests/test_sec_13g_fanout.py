@@ -49,6 +49,49 @@ def test_parse_didi_html():
     assert pos is not None
     assert pos["investee_ticker"] == "DIDIY"
     assert pos["ownership_pct"] == 11.8
+    assert pos["shares_held"] == 143_911_749
+
+
+def test_live_13g_pct_only_does_not_fake_shares():
+    """Neutron-class: % without share count must not become shares_held=22.87."""
+    from hidden_stock.quirks.holdings.sec_13g import raw_to_live_row
+
+    live = raw_to_live_row(
+        {
+            "issuer_name": "Neutron Holdings, Inc.",
+            "ticker": None,
+            "ownership_pct": 22.87,
+            "shares": None,
+            "cusip": None,
+        },
+        parent_ticker="UBER",
+        form="SCHEDULE 13G",
+        acc="acc-neutron",
+        filing_date="2026-01-01",
+        cik="0001543151",
+    )
+    assert live is not None
+    assert live["ownership_pct"] == 22.87
+    assert live["shares_held"] is None
+
+    pos = raw_to_position(
+        {
+            "issuer_name": "Neutron Holdings, Inc.",
+            "ticker": None,
+            "ownership_pct": 22.87,
+            "shares": None,
+            "cusip": None,
+        },
+        parent_ticker="UBER",
+        form="SCHEDULE 13G",
+        acc="acc-neutron",
+        filing_date="2026-01-01",
+        cik="0001543151",
+    )
+    assert pos is not None
+    assert "qoq_continuity=ownership_pct" in str(pos["note"])
+    assert pos["shares_held"] is None  # never stuff % into shares_held
+    assert pos["ownership_pct"] == 22.87
 
 
 def test_self_issuer_dropped():

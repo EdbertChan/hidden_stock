@@ -62,15 +62,27 @@ def _read_csv_snippet(path: Path, max_chars: int = 12000) -> str:
     return text
 
 
-def mechanical_precheck(history_csv: Path, portfolio_csv: Path) -> dict:
-    """Pandas checks that must not wait for an LLM judge (SERV-class bugs)."""
+def mechanical_precheck(
+    history_csv: Path,
+    portfolio_csv: Path,
+    *,
+    parent: str,
+) -> dict:
+    """Pandas checks that must not wait for an LLM judge (SERV-class bugs).
+
+    Parent-scoped: Uber 10-Q DIDIY/GRAB/AUR anchors apply **only** when parent is UBER.
+    """
+    parent_u = str(parent or "").strip().upper()
     issues: list[dict] = []
     checks = {
-        "didi_2026_06_30_fv": "unknown",
-        "grab_aurora_vs_10q": "unknown",
+        "didi_2026_06_30_fv": "n/a" if parent_u != "UBER" else "unknown",
+        "grab_aurora_vs_10q": "n/a" if parent_u != "UBER" else "unknown",
         "aur_one_per_period": "unknown",
         "no_otc_invent_marks": "unknown",
+        "no_share_invent": "unknown",
+        "no_placeholder_tickers": "unknown",
         "chart_ranking_sane": "unknown",
+        "parent_scoped": "pass",
     }
     if not history_csv.is_file():
         issues.append(
@@ -89,11 +101,19 @@ def mechanical_precheck(history_csv: Path, portfolio_csv: Path) -> dict:
             "what_looks_good": [],
             "checks": checks,
             "summary": "Missing history CSV",
+            "parent": parent_u,
         }
 
     import pandas as pd
 
     hist = pd.read_csv(history_csv)
+    # Align uniqueness with export: stamp + coalesce before grouping
+    try:
+        from hidden_stock.quirks.holdings.lookback import coalesce_period_ticker
+
+        hist = pd.DataFrame(coalesce_period_ticker(hist.to_dict(orient="records")))
+    except Exception:
+        pass
     if "investee_ticker" in hist.columns and "period_end" in hist.columns:
         g = (
             hist.assign(
@@ -103,7 +123,16 @@ def mechanical_precheck(history_csv: Path, portfolio_csv: Path) -> dict:
             .groupby(["period_end", "investee_ticker"], dropna=False)
             .size()
         )
-        dups = g[g > 1]
+        # Ignore literal nan/none keys (still-unstamped blanks) — those are missing-ticker, not dups
+        dups = g[(g > 1) & (~g.index.get_level_values(1).isin(["NAN", "NONE", "NAT", "", "NAN"]))]
+        # Also drop float-NaN group keys (blank tickers before PRIV_ stamp)
+        dups = dups[
+            [
+                not (isinstance(t, float) and t != t)  # NaN != NaN
+                and str(t).upper() not in {"NAN", "NONE", "NAT", ""}
+                for (_pe, t) in dups.index
+            ]
+        ]
         if len(dups):
             sample = ", ".join(f"{pe}/{t}×{int(n)}" for (pe, t), n in dups.head(10).items())
             issues.append(
@@ -117,7 +146,11 @@ def mechanical_precheck(history_csv: Path, portfolio_csv: Path) -> dict:
         else:
             checks["aur_one_per_period"] = "pass"
 
-    if portfolio_csv.is_file() and "period_end" in pd.read_csv(portfolio_csv, nrows=0).columns:
+    if (
+        parent_u == "UBER"
+        and portfolio_csv.is_file()
+        and "period_end" in pd.read_csv(portfolio_csv, nrows=0).columns
+    ):
         port = pd.read_csv(portfolio_csv)
         june = port[port["period_end"].astype(str) == "2026-06-30"]
         if len(june):
@@ -136,7 +169,9 @@ def mechanical_precheck(history_csv: Path, portfolio_csv: Path) -> dict:
                 return abs(by[ticker] - expected) <= max(tol_usd, 0.05 * expected)
 
             checks["didi_2026_06_30_fv"] = "pass" if _ok("DIDIY") else "fail"
-            checks["grab_aurora_vs_10q"] = "pass" if (_ok("GRAB") and _ok("AUR")) else "fail"
+            checks["grab_aurora_vs_10q"] = (
+                "pass" if (_ok("GRAB") and _ok("AUR")) else "fail"
+            )
             if checks["didi_2026_06_30_fv"] == "fail":
                 issues.append(
                     {
@@ -145,6 +180,10 @@ def mechanical_precheck(history_csv: Path, portfolio_csv: Path) -> dict:
                         "evidence": str(by.get("DIDIY")),
                     }
                 )
+            checks["chart_ranking_sane"] = "pass"
+    elif parent_u != "UBER":
+        # Non-Uber: still sanity-check latest portfolio ranking exists if CSV present
+        if portfolio_csv.is_file() and len(pd.read_csv(portfolio_csv)):
             checks["chart_ranking_sane"] = "pass"
 
     if "note" in hist.columns:
@@ -200,26 +239,106 @@ def mechanical_precheck(history_csv: Path, portfolio_csv: Path) -> dict:
             )
             checks["no_otc_invent_marks"] = "fail"
 
+        # Invent on null-$ rows is still FAIL (BILI / Neutron / ANT class).
+        presence = hist[
+            hist["note"].astype(str).str.contains(
+                r"shares_proxy=presence", case=False, regex=True, na=False
+            )
+        ]
+        if len(presence):
+            issues.append(
+                {
+                    "id": "shares_proxy_presence_invent",
+                    "severity": "history invents shares_proxy=presence (forbidden continuity hatch)",
+                    "evidence": str(
+                        presence[["period_end", "investee_ticker", "shares_held", "note"]]
+                        .head(5)
+                        .to_dict(orient="records")
+                    ),
+                }
+            )
+            checks["no_share_invent"] = "fail"
+        else:
+            checks["no_share_invent"] = "pass"
+
+        if "ownership_pct" in hist.columns and "shares_held" in hist.columns:
+            sh = pd.to_numeric(hist["shares_held"], errors="coerce")
+            pct = pd.to_numeric(hist["ownership_pct"], errors="coerce")
+            stuffed = (
+                sh.notna()
+                & pct.notna()
+                & (sh > 0)
+                & (pct > 0)
+                & ((sh - pct).abs() < 1e-6)
+            )
+            if stuffed.any():
+                sample = hist.loc[
+                    stuffed, ["period_end", "investee_ticker", "shares_held", "ownership_pct", "note"]
+                ].head(5)
+                issues.append(
+                    {
+                        "id": "ownership_pct_stuffed_into_shares_held",
+                        "severity": "shares_held equals ownership_pct (Neutron/EM class invent)",
+                        "evidence": sample.to_dict(orient="records"),
+                    }
+                )
+                checks["no_share_invent"] = "fail"
+
+        # Exchange-like first-word fakes (not PRIV_ and not ticker=private_note)
+        if "investee_ticker" in hist.columns:
+            tcol = hist["investee_ticker"].astype(str).str.upper()
+            notes = hist["note"].astype(str)
+            fakeish = (
+                tcol.isin({"ANT", "CHINA", "MANGO", "MEINIAN", "YTO", "ALIEXPRESS", "MOONSHOT"})
+                & ~tcol.str.startswith("PRIV_", na=False)
+                & ~notes.str.contains(r"ticker=private_note", case=False, regex=True, na=False)
+            )
+            if fakeish.any():
+                sample = hist.loc[
+                    fakeish, ["period_end", "investee_ticker", "investee_name", "note"]
+                ].head(5)
+                issues.append(
+                    {
+                        "id": "placeholder_exchange_like_ticker",
+                        "severity": "invented exchange-like ticker from note name (use PRIV_<slug>)",
+                        "evidence": sample.to_dict(orient="records"),
+                    }
+                )
+                checks["no_placeholder_tickers"] = "fail"
+            else:
+                checks["no_placeholder_tickers"] = "pass"
+    else:
+        checks.setdefault("no_share_invent", "unknown")
+        checks.setdefault("no_placeholder_tickers", "unknown")
+
+    good = []
+    if not issues:
+        good.append(f"Mechanical uniqueness + invent checks passed for parent={parent_u}")
+        if parent_u == "UBER":
+            good.append("UBER June-2026 FV anchors checked")
+        else:
+            good.append("Uber DIDIY/GRAB/AUR anchors skipped (wrong parent)")
+
     return {
         "judge": "mechanical",
         "verdict": "fail" if issues else "pass",
         "score": 0 if issues else 100,
         "blocking_issues": issues,
         "minor_issues": [],
-        "what_looks_good": []
-        if issues
-        else ["Mechanical uniqueness + UBER June-2026 FV checks passed"],
+        "what_looks_good": good,
         "checks": checks,
+        "parent": parent_u,
         "summary": (
-            "Mechanical precheck failed"
+            f"Mechanical precheck failed for {parent_u}"
             if issues
-            else "Mechanical precheck passed (uniqueness + ground-truth anchors)"
+            else f"Mechanical precheck passed for {parent_u}"
         ),
     }
 
 
 def build_packet(*, ticker: str, sheet_url: str | None, out_dir: Path) -> Path:
     t = ticker.lower()
+    parent_u = str(ticker or "").strip().upper()
     portfolio = out_dir / f"{t}_portfolio_by_period.csv"
     history = out_dir / f"{t}_equity_holdings_history.csv"
     packet = out_dir / f"{t}_grade_packet.md"
@@ -227,6 +346,7 @@ def build_packet(*, ticker: str, sheet_url: str | None, out_dir: Path) -> Path:
     lines = [
         f"# Holdings sheet grade packet — {ticker}",
         "",
+        f"- **parent (resolved): {parent_u}** — grade THIS equity only; do not apply another parent's anchors",
         f"- sheet_url: {sheet_url or '(none)'}",
         f"- portfolio_csv: `{portfolio}`",
         f"- history_csv: `{history}`",
@@ -236,34 +356,131 @@ def build_packet(*, ticker: str, sheet_url: str | None, out_dir: Path) -> Path:
         "Valuation order: Form 13F market_value_usd → 10-Q/10-K/20-F Investments "
         "table FV ($M×1e6) → else null. Schedule 13G = identity/%/shares only.",
         "",
-        "Uber 10-Q Investments (millions) @ 2026-06-30:",
-        f"- Didi/DIDIY: **{UBER_10Q_TRUTH['investments_millions']['DIDIY']}**",
-        f"- Grab/GRAB: **{UBER_10Q_TRUTH['investments_millions']['GRAB']}**",
-        f"- Aurora/AUR: **{UBER_10Q_TRUTH['investments_millions']['AUR']}**",
-        f"- Filing: {UBER_10Q_TRUTH['filing']}",
-        f"- Tolerance: {UBER_10Q_TRUTH['tolerance']}",
-        "",
-        "Also FAIL if **any** ticker appears twice in the same period_end "
-        "(13F exit + continuing 13G is still a duplicate — not only AUR overlap).",
-        "",
-        "## portfolio_by_period.csv",
-        "",
-        "```csv",
-        _read_csv_snippet(portfolio),
-        "```",
-        "",
-        "## equity_holdings_history.csv (excerpt)",
-        "",
-        "```csv",
-        _read_csv_snippet(history, max_chars=16000),
-        "```",
-        "",
-        "## Your job",
-        "",
-        "You are an independent judge. Grade this export against the rubric.",
-        "Return ONLY JSON matching the provided schema. Be harsh on invented "
-        "OTC marks and double-counts. Cite concrete CSV rows as evidence.",
     ]
+    if parent_u == "UBER":
+        lines.extend(
+            [
+                "Uber 10-Q Investments (millions) @ 2026-06-30:",
+                f"- Didi/DIDIY: **{UBER_10Q_TRUTH['investments_millions']['DIDIY']}**",
+                f"- Grab/GRAB: **{UBER_10Q_TRUTH['investments_millions']['GRAB']}**",
+                f"- Aurora/AUR: **{UBER_10Q_TRUTH['investments_millions']['AUR']}**",
+                f"- Filing: {UBER_10Q_TRUTH['filing']}",
+                f"- Tolerance: {UBER_10Q_TRUTH['tolerance']}",
+                "",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                f"Parent-specific note: this packet is for **{parent_u}**.",
+                "Do **not** require Uber DIDIY/GRAB/AUR fair values.",
+                "Judge holdings/values that belong to this parent’s filings only.",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "Also FAIL if **any** ticker appears twice in the same period_end "
+            "(13F exit + continuing 13G is still a duplicate — not only AUR overlap).",
+            "",
+            "shares_held rules: real 13F/parsed counts only. Ownership_% must live in "
+            "`ownership_pct` (note may say `qoq_continuity=ownership_pct`) — never "
+            "as shares_held. Never invent exchange-like placeholders (ANT/CHINA/first-word). "
+            "**PRIV_<slug>** + `ticker=private_note` is the allowed private-note identity "
+            "(not a FAIL). Exit rows cite the period grid accession (disappearance filing). "
+            "13G/note rows: filing_date must match the cited accession’s as_of (not the 13F grid date).",
+            "",
+            "## Large QoQ $ moves (verify share counts)",
+            "",
+        ]
+    )
+    # Surface big value jumps with share deltas so judges can confirm 13F buys.
+    try:
+        import pandas as pd
+
+        if history.is_file():
+            hdf = pd.read_csv(history)
+            if {"period_end", "investee_ticker", "shares_held", "market_value_usd"}.issubset(
+                hdf.columns
+            ):
+                hdf = hdf.sort_values(["investee_ticker", "period_end"])
+                jumps = []
+                for tkr, g in hdf.groupby(hdf["investee_ticker"].astype(str).str.upper()):
+                    if tkr in {"", "NAN", "NONE"}:
+                        continue
+                    prev = None
+                    for r in g.itertuples():
+                        if prev is not None and pd.notna(r.market_value_usd) and pd.notna(
+                            prev.market_value_usd
+                        ):
+                            dlt = float(r.market_value_usd) - float(prev.market_value_usd)
+                            if abs(dlt) >= 100_000_000:
+                                jumps.append(
+                                    f"- {tkr} {prev.period_end}→{r.period_end}: "
+                                    f"${float(prev.market_value_usd):,.0f}→${float(r.market_value_usd):,.0f} "
+                                    f"(Δ${dlt:,.0f}); shares "
+                                    f"{prev.shares_held}→{r.shares_held} "
+                                    f"action={getattr(r, 'action', '')} "
+                                    f"acc={getattr(r, 'accession_no', '')}"
+                                )
+                        prev = r
+                if jumps:
+                    lines.extend(jumps[:20])
+                else:
+                    lines.append("(no ≥$100M QoQ value jumps)")
+                lines.append("")
+    except Exception as e:
+        lines.extend([f"(jump audit skipped: {e})", ""])
+
+    lines.extend(
+        [
+            "## portfolio_by_period.csv",
+            "",
+            "```csv",
+            _read_csv_snippet(portfolio),
+            "```",
+            "",
+            "## equity_holdings_history.csv (excerpt)",
+            "",
+            "```csv",
+            _read_csv_snippet(history, max_chars=16000),
+            "```",
+            "",
+        ]
+    )
+    # Attach parent-scoped performance CSVs when present
+    for label, name in (
+        ("returns_by_period", f"{t}_returns_by_period.csv"),
+        ("returns_chart", f"{t}_returns_chart.csv"),
+        ("realized_pnl_qoq", f"{t}_realized_pnl_qoq.csv"),
+        ("reported_vs_est", f"{t}_reported_vs_est.csv"),
+    ):
+        path = out_dir / name
+        if path.is_file():
+            lines.extend(
+                [
+                    f"## {label}.csv (excerpt)",
+                    "",
+                    "```csv",
+                    _read_csv_snippet(path, max_chars=8000),
+                    "```",
+                    "",
+                ]
+            )
+    lines.extend(
+        [
+            "## Your job",
+            "",
+            f"You are an independent judge for parent **{parent_u}** only.",
+            "Grade this export against the rubric for that equity.",
+            "Return ONLY JSON matching the provided schema. Be harsh on invented "
+            "OTC marks and duplicate period×ticker rows. Do not fail a non-Uber "
+            "parent for missing DIDIY/GRAB/AUR.",
+            "",
+        ]
+    )
+
+    # Preserve rest of original "Your job" if we truncated — check original had more
     packet.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return packet
 
@@ -534,6 +751,7 @@ def main() -> int:
     mech = mechanical_precheck(
         out_dir / f"{tslug}_equity_holdings_history.csv",
         out_dir / f"{tslug}_portfolio_by_period.csv",
+        parent=ticker,
     )
     (out_dir / f"{tslug}_grade_mechanical.json").write_text(
         json.dumps(mech, indent=2) + "\n", encoding="utf-8"

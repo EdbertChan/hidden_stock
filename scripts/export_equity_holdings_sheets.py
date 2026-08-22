@@ -50,7 +50,18 @@ def main() -> int:
     )
     p.add_argument("--live", action="store_true", help="Refresh stock_data.equity_holdings")
     p.add_argument("--history", action="store_true", help="Refresh QoQ equity_holdings_history")
-    p.add_argument("--max-filings", type=int, default=40)
+    p.add_argument(
+        "--lookback-years",
+        type=int,
+        default=5,
+        help="Primary history depth: calendar years from today/as_of (default 5)",
+    )
+    p.add_argument(
+        "--max-filings",
+        type=int,
+        default=80,
+        help="Safety ceiling inside the year window (newest-first, default 80)",
+    )
     p.add_argument("--out-dir", default=str(_ROOT / "exports"))
     p.add_argument("--no-sheets", action="store_true", help="Skip Google Sheets push")
     p.add_argument("--spreadsheet-id", default=None, help="Target sheet when reusing")
@@ -86,6 +97,7 @@ def main() -> int:
         refresh=bool(args.live),
         history=bool(args.history),
         max_filings=int(args.max_filings),
+        lookback_years=int(args.lookback_years),
         out_dir=args.out_dir,
         push_sheets=not args.no_sheets,
         spreadsheet_id=args.spreadsheet_id,

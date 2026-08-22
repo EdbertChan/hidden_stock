@@ -43,11 +43,36 @@ def _is_13f_source(src: str) -> bool:
     )
 
 
+def _source_allows_chart_dollars(src: str | None, note: str | None = None) -> bool:
+    """Only Investments-table (or 13F) may populate market_value from note fields."""
+    blob = f"{src or ''} {note or ''}".lower()
+    if "13f" in blob and "investments_table" not in blob:
+        # 13F market_value is set directly; this gate is for note→$ mapping
+        return False
+    return "investments_table" in blob
+
+
+def _apply_disclosed_fv(row: dict) -> None:
+    """Map disclosed FV onto market_value when still null — never narrative cost alone."""
+    if row.get("market_value_usd") is not None:
+        return
+    src = str(row.get("_source") or "")
+    note = str(row.get("note") or "")
+    if not _source_allows_chart_dollars(src, note):
+        return
+    fv = row.get("fair_value_disclosed_usd")
+    if fv is None:
+        fv = row.get("carrying_usd")
+    if fv is not None:
+        row["market_value_usd"] = fv
+
+
 def merge_raw_holdings(parts: list[list[dict]]) -> list[dict]:
     """Dedupe by ticker/CUSIP/name; prefer 13F market fields when both exist.
 
     Collide on ticker so 13G cannot double-count a 13F name (AUR/GRAB). Map
-    disclosed fair value / carrying onto market_value when still null.
+    Investments-table disclosed FV onto market_value when still null — not
+    narrative amount-invested / equity-method carrying alone.
     """
     merged: dict[str, dict] = {}
     ticker_key: dict[str, str] = {}
@@ -65,14 +90,6 @@ def merge_raw_holdings(parts: list[list[dict]]) -> list[dict]:
         "13g": 2,
         "hk_annual": 1,
     }
-
-    def _apply_disclosed_fv(row: dict) -> None:
-        if row.get("market_value_usd") is None:
-            fv = row.get("fair_value_disclosed_usd")
-            if fv is None:
-                fv = row.get("carrying_usd")
-            if fv is not None:
-                row["market_value_usd"] = fv
 
     for group in parts:
         for raw in group:
@@ -129,16 +146,22 @@ def merge_raw_holdings(parts: list[list[dict]]) -> list[dict]:
                 ):
                     if raw.get(k) is not None and out.get(k) is None:
                         out[k] = raw[k]
-                # Investments-table / note disclosed FV fills null 13G dollars
+                # Investments-table disclosed FV fills null 13G dollars (not narrative cost)
                 filled_disclosed_mv = False
                 if out.get("market_value_usd") is None:
-                    if raw.get("market_value_usd") is not None:
+                    if raw.get("market_value_usd") is not None and _source_allows_chart_dollars(
+                        src, raw.get("note")
+                    ):
                         out["market_value_usd"] = raw["market_value_usd"]
                         filled_disclosed_mv = True
-                    elif raw.get("fair_value_disclosed_usd") is not None:
+                    elif raw.get("fair_value_disclosed_usd") is not None and _source_allows_chart_dollars(
+                        src, raw.get("note")
+                    ):
                         out["market_value_usd"] = raw["fair_value_disclosed_usd"]
                         filled_disclosed_mv = True
-                    elif raw.get("carrying_usd") is not None:
+                    elif raw.get("carrying_usd") is not None and _source_allows_chart_dollars(
+                        src, raw.get("note")
+                    ):
                         out["market_value_usd"] = raw["carrying_usd"]
                         filled_disclosed_mv = True
                 if filled_disclosed_mv and src:
@@ -179,11 +202,12 @@ def _finalize_rows(raw_rows: list[dict], *, skip_eodhd_for_13f: bool = True) -> 
             }:
                 base[k] = v
         if base.get("market_value_usd") is None:
-            fv = base.get("fair_value_disclosed_usd")
-            if fv is None:
-                fv = base.get("carrying_usd")
-            if fv is not None:
-                base["market_value_usd"] = fv
+            _apply_disclosed_fv(base)
+        elif not _is_13f_source(str(raw.get("_source") or "")) and not _source_allows_chart_dollars(
+            raw.get("_source"), base.get("note")
+        ):
+            # Narrative cost / equity-method carrying must not remain as chart $
+            base["market_value_usd"] = None
         enriched = apply_gaap_and_adj(base)
         if raw.get("_source") and enriched.get("note"):
             if f"source={raw['_source']}" not in str(enriched["note"]):
@@ -191,7 +215,9 @@ def _finalize_rows(raw_rows: list[dict], *, skip_eodhd_for_13f: bool = True) -> 
         elif raw.get("_source"):
             enriched["note"] = f"source={raw['_source']}"
         rows.append({c: enriched.get(c) for c in HOLDINGS_COLUMNS})
-    return rows
+    from .validate import scrub_live_pct_as_shares
+
+    return scrub_live_pct_as_shares(rows)
 
 
 def process_parent_holdings(

@@ -163,17 +163,28 @@ def fetch_filer_13f_filings(
     *,
     as_of: str | None = None,
     max_filings: int = 40,
+    lookback_start: str | None = None,
     use_cache: bool = True,
 ) -> list[dict]:
-    """Fetch Form 13F filings for a filer CIK (newest first), capped at max_filings."""
+    """Fetch Form 13F filings for a filer CIK (newest first), capped at max_filings.
+
+    When ``lookback_start`` is set, only filings with filedAt in
+    ``[lookback_start, as_of|today]`` are returned.
+    """
+    from datetime import date
+
+    from .lookback import date_on_or_after
+
     api_key = os.environ.get("SEC_API_KEY")
     if not api_key:
         raise RuntimeError("SEC_API_KEY not set")
 
     q_cik = cik_for_query(cik)
-    as_of_part = f" AND filedAt:[2000-01-01 TO {as_of}]" if as_of else ""
+    end = (as_of or date.today().isoformat())[:10]
+    start = (lookback_start or "2000-01-01")[:10]
+    as_of_part = f" AND filedAt:[{start} TO {end}]"
     query = f"cik:{q_cik}{as_of_part}"
-    cache_key = f"filer|{q_cik}|{as_of or 'latest'}|{max_filings}"
+    cache_key = f"filer|{q_cik}|{start}|{end}|{max_filings}"
     if use_cache:
         cached = _CACHE.get(cache_key)
         if cached is not None:
@@ -199,8 +210,12 @@ def fetch_filer_13f_filings(
             total = tot
 
         for filing in batch:
-            if isinstance(filing, dict):
-                out.append(filing)
+            if not isinstance(filing, dict):
+                continue
+            filed = str(filing.get("filedAt") or "")[:10]
+            if lookback_start and filed and not date_on_or_after(filed, start):
+                continue
+            out.append(filing)
             if len(out) >= max_filings:
                 break
 
@@ -222,6 +237,7 @@ def collect_filer_13f_periods(
     cik: str,
     as_of: str | None = None,
     max_filings: int = 40,
+    lookback_start: str | None = None,
 ) -> tuple[list[tuple[str, str, str, list[dict]]], dict[str, Any]]:
     """Oldest→newest (period_end, filing_date, accession, rows); one filing per period."""
     meta: dict[str, Any] = {
@@ -231,9 +247,15 @@ def collect_filer_13f_periods(
         "num_periods": 0,
         "error": None,
         "source": "sec_api_13f",
+        "lookback_start": lookback_start,
     }
     try:
-        filings = fetch_filer_13f_filings(cik, as_of=as_of, max_filings=max_filings)
+        filings = fetch_filer_13f_filings(
+            cik,
+            as_of=as_of,
+            max_filings=max_filings,
+            lookback_start=lookback_start,
+        )
     except Exception as e:
         meta["error"] = str(e)
         return [], meta

@@ -106,10 +106,23 @@ def test_chart_data_frame_wide_and_excludes_mrdb():
                 "action": "hold",
                 "market_value_usd": 100_000_000,
             },
+            {
+                "period_end": "2024-06-30",
+                "investee_ticker": "WB",
+                "investee_name": "Weibo",
+                "action": "hold",
+                "market_value_usd": 10_000_000,
+            },
         ]
     )
     wide = chart_data_frame(hist)
     assert "period_end" in wide.columns
     assert "XPEV" in wide.columns
+    assert "WB" in wide.columns
     assert "MRDB" not in wide.columns
+    assert "OTHER" not in wide.columns
     assert float(wide.loc[wide["period_end"] == "2024-06-30", "XPEV"].iloc[0]) == 100.0
+    # top_n omits smaller names — still no OTHER
+    wide_top = chart_data_frame(hist, top_n=1)
+    assert list(c for c in wide_top.columns if c != "period_end") == ["XPEV"]
+    assert "OTHER" not in wide_top.columns

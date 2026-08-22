@@ -84,3 +84,27 @@ def test_assert_unique_period_ticker_raises():
         assert False, "expected ValueError"
     except ValueError as e:
         assert "SERV" in str(e)
+
+
+def test_assert_unique_tolerates_pandas_nan_ticker():
+    """BABA crash: DataFrame None→float('nan'); (nan or '').strip() AttributeError."""
+    from hidden_stock.quirks.holdings.lookback import normalize_ticker
+
+    rows = [
+        {
+            "period_end": "2024-03-31",
+            "investee_ticker": float("nan"),
+            "action": "hold",
+            "shares_held": 1.0,
+        },
+        {
+            "period_end": "2024-03-31",
+            "investee_ticker": "BILI",
+            "action": "hold",
+            "shares_held": 1.0,
+        },
+    ]
+    assert_unique_period_ticker(rows, context="nan-ok")
+    assert normalize_ticker(float("nan")) is None
+    assert normalize_ticker(None) is None
+    assert normalize_ticker(" bili ") == "BILI"
