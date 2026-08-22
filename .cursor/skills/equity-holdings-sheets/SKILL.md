@@ -76,7 +76,16 @@ Merge collide on **ticker** (and CUSIP) so 13G cannot double-count a 13F name (A
 
 ## How you check (before saying fixed)
 
+Invariant (not “last bug name”):
+
+```text
+history.groupby(period_end, investee_ticker).size() == 1   # every ticker
+```
+
 1. Sheet `portfolio_by_period` / `chart_data`: for UBER mid-2026, DIDIY ≈ **1900** ($M), not ~482.
-2. History: **one row per ticker per `period_end`** (no doubled AUR).
+2. History: **one row per ticker per `period_end`** (AUR, SERV, GRAB, … — chart can hide exits/nulls).
 3. Open the parent’s latest 10-Q/10-K Investments table; match Grab/Aurora/Didi (or equivalents) to our numbers.
-4. `uv run pytest tests/test_holdings_ci_regressions.py tests/ -q`.
+4. `uv run pytest tests/test_holdings_ci_regressions.py tests/test_serv_period_uniqueness.py tests/ -q`.
+5. Independent second opinion: `/holdings-sheet-swarm-grade <ticker>` (mechanical + Fable + Codex).
+
+Fan-out shape: ticker → CIK → **13F + 13D/G + notes** → merge to **one row per ticker per period**. Do not invent stake `$` (OTC×shares).

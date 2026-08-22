@@ -1,0 +1,56 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["judge", "verdict", "score", "blocking_issues", "minor_issues", "what_looks_good", "checks", "summary"],
+  "properties": {
+    "judge": { "type": "string" },
+    "verdict": { "type": "string", "enum": ["pass", "fail", "needs_work"] },
+    "score": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "blocking_issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "severity", "evidence"],
+        "properties": {
+          "id": { "type": "string" },
+          "severity": { "type": "string" },
+          "evidence": { "type": "string" }
+        }
+      }
+    },
+    "minor_issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "severity", "evidence"],
+        "properties": {
+          "id": { "type": "string" },
+          "severity": { "type": "string" },
+          "evidence": { "type": "string" }
+        }
+      }
+    },
+    "what_looks_good": { "type": "array", "items": { "type": "string" } },
+    "checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "didi_2026_06_30_fv",
+        "grab_aurora_vs_10q",
+        "aur_one_per_period",
+        "no_otc_invent_marks",
+        "chart_ranking_sane"
+      ],
+      "properties": {
+        "didi_2026_06_30_fv": { "type": "string", "enum": ["pass", "fail", "unknown"] },
+        "grab_aurora_vs_10q": { "type": "string", "enum": ["pass", "fail", "unknown"] },
+        "aur_one_per_period": { "type": "string", "enum": ["pass", "fail", "unknown"] },
+        "no_otc_invent_marks": { "type": "string", "enum": ["pass", "fail", "unknown"] },
+        "chart_ranking_sane": { "type": "string", "enum": ["pass", "fail", "unknown"] }
+      }
+    },
+    "summary": { "type": "string" }
+  }
+}
