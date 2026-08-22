@@ -1,72 +1,82 @@
 ---
 name: equity-holdings-sheets
 description: >-
-  Refresh BABA (or allowlisted) equity holdings to Postgres, export CSVs, and
-  push Google Sheets tabs plus the stacked QoQ chart. Use when the user asks to
-  run/export holdings to Sheets, productionize spreadsheet creation, refresh
-  Moonshot/Ant note history, or materialize equity_holdings_job.
+  Track or export quarter-over-quarter equity holdings for any parent company
+  or ticker (BABA, Tencent/TCEHY, BRK-B, Uber/UBER, …): resolve alias → refresh
+  Postgres → CSV + Google Sheets with stacked QoQ chart. Invoke explicitly as
+  /equity-holdings-sheets <company|ticker> (e.g. /equity-holdings-sheets uber or
+  /equity-holdings-sheets tencent).
+disable-model-invocation: true
 ---
 
-# Equity holdings → Postgres / CSV / Google Sheets
+# Equity holdings → Postgres / CSV / Google Sheets (stock-agnostic)
 
-## When to use
+## Trigger examples
 
-- Export or refresh BABA (or other allowlist) equity holdings
-- Create/update the Google Spreadsheet with QoQ chart
-- Materialize `equity_holdings_job` in Dagster
-- Debug why private names (Moonshot, Ant) are missing from QoQ
+Invoke explicitly:
 
-## Auth (required for Sheets)
+- `/equity-holdings-sheets tencent`
+- `/equity-holdings-sheets uber`
+- `/equity-holdings-sheets BABA`
 
-Service accounts have **0 Drive quota** and cannot create files.
+## Agent workflow (required)
 
-**Preferred (new sheet each experiment):**
-
-1. GCP → OAuth client (Desktop) JSON
-2. `python scripts/google_sheets_oauth_setup.py --client-secrets /path/to/client.json`
-3. Set in `.env`:
-   - `GOOGLE_SHEETS_OAUTH_CLIENT_SECRETS`
-   - `GOOGLE_SHEETS_OAUTH_TOKEN`
-   - `GOOGLE_SHEETS_CREATE_NEW=1`
-
-**Reuse one sheet:** share it with the SA email, set `GOOGLE_SHEETS_SPREADSHEET_ID`, run with `--reuse-sheet`.
-
-Also required: `GOOGLE_SHEETS_CREDENTIALS_JSON` (SA JSON path), `SEC_EDGAR_USER_AGENT`, `POSTGRES_*`.
-
-## One-shot CLI
+1. **Resolve parent** with `normalize_parent` / aliases:
+   - `tencent` / `0700` / `TCTZF` → `TCEHY`
+   - `alibaba` → `BABA`
+   - `berkshire` / `brk.b` → `BRK-B`
+   - else uppercase ticker (`XPEV`-style parents use their own ticker)
+2. **Auth** — service accounts have 0 Drive quota:
+   - New experiment sheet: OAuth (`GOOGLE_SHEETS_OAUTH_*`) + `--new-sheet`
+   - Reuse: share sheet with SA, set `GOOGLE_SHEETS_SPREADSHEET_ID`, `--reuse-sheet`
+3. **Run** (prefer CLI for one ticker):
 
 ```bash
 set -a && source .env && set +a
-# New experiment spreadsheet (OAuth)
-python scripts/export_equity_holdings_sheets.py --ticker BABA --live --history --new-sheet
-
-# Reuse fixed ID
-python scripts/export_equity_holdings_sheets.py --ticker BABA --live --history --reuse-sheet \
-  --spreadsheet-id "$GOOGLE_SHEETS_SPREADSHEET_ID"
+python scripts/export_equity_holdings_sheets.py \
+  --ticker <RESOLVED> --live --history --new-sheet
 ```
 
-Tabs written: `positions_qoq`, `current_holdings`, `portfolio_by_period`, `chart_data` (+ embedded stacked column chart).
-
-## Dagster production path
+   Or Dagster with explicit allowlist (no default ticker):
 
 ```bash
-# Allowlist BABA (config on asset materialization)
+# Materialize with config ticker_allowlist=["TCEHY"] (or BABA, etc.)
 dagster asset materialize -m hidden_stock.definitions \
   --select equity_holdings,equity_holdings_history,equity_holdings_export
 ```
 
-Job: `equity_holdings_job` selects all three. History uses `build_holdings_history` (13F QoQ **plus** forward-filled 20-F/10-K notes).
+4. **Reply** with spreadsheet URL and sources used (`13f+13g+notes` fan-out; HK parents also use annual aggregates).
 
-## Data model notes
 
-- **Listed (XPEV, WB, …):** 13F shares + market value, true QoQ
-- **Private (Moonshot, Ant):** annual 20-F/10-K note parse; ownership % + carrying USD; forward-filled into each 13F quarter after the note filing date
-- Chart excludes known value spikes (`MRDB`) via `CHART_EXCLUDE_TICKERS`
+## Tabs
 
-## Agent checklist
+`positions_qoq`, `current_holdings`, `portfolio_by_period`, `chart_data` (+ stacked column chart).
 
-1. Confirm `.env` has Postgres + Edgar + Sheets auth
-2. Run export or Dagster materialize for the ticker allowlist
-3. Verify Moonshot appears on `current_holdings` and `chart_data` / `positions_qoq`
-4. Paste the spreadsheet URL back to the user
-5. Do **not** commit `.env`, SA JSON, or OAuth tokens
+## Rules
+
+- Never hardcode BABA; always take ticker from the user request.
+- `equity_holdings_history` / `equity_holdings_export` **require** `ticker_allowlist`.
+- Do not commit `.env`, SA JSON, or OAuth tokens.
+- CI: `uv run pytest tests/` (see `.github/workflows/ci.yml`); holdings regressions live in `tests/test_holdings_ci_regressions.py`.
+
+## Valuation (do not invent stake $)
+
+For each investee × period, in order:
+
+1. Form **13F** `market_value_usd` if present (listed book).
+2. Else **10-Q / 10-K / 20-F Investments table** (or notes) disclosed FV/carrying — `$M × 1e6`.
+3. Else leave `market_value_usd` **null** (omit from chart).
+4. Schedule **13D/G** → ownership % / shares / name only — **never** primary dollars.
+
+**Never** invent stake dollars via OTC/EODHD `shares × price` or `mcap × ownership_%`. That path shipped DiDi at ~$482M when Uber’s 10-Q already disclosed **$1,900M**.
+
+Null chart cells are OK until a filing discloses FV. Do **not** “fix” a missing DIDIY bar by inventing a mark.
+
+Merge collide on **ticker** (and CUSIP) so 13G cannot double-count a 13F name (AUR/GRAB).
+
+## How you check (before saying fixed)
+
+1. Sheet `portfolio_by_period` / `chart_data`: for UBER mid-2026, DIDIY ≈ **1900** ($M), not ~482.
+2. History: **one row per ticker per `period_end`** (no doubled AUR).
+3. Open the parent’s latest 10-Q/10-K Investments table; match Grab/Aurora/Didi (or equivalents) to our numbers.
+4. `uv run pytest tests/test_holdings_ci_regressions.py tests/ -q`.

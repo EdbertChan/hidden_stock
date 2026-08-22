@@ -171,33 +171,18 @@ def fetch_eodhd_market_cap(ticker: str) -> float | None:
 
 
 def enrich_holding_mtm(holding: dict, as_of: str | None = None) -> dict:
-    """Attach EODHD market value when possible, then apply GAAP adj rules."""
+    """Map disclosed FV/carrying onto market_value, then apply GAAP adj.
+
+    Never invent stake dollars via EODHD shares×price or mcap×ownership.
+    Those marks are not GAAP fair value (DiDi OTC invent ≈$482M vs 10-Q $1.9B).
+    ``as_of`` is kept for call-site compatibility; it does not drive valuation.
+    """
+    _ = as_of
     row = dict(holding)
-    shares = _f(row.get("shares_held"))
-    ownership_pct = _f(row.get("ownership_pct"))
-    ticker = row.get("investee_ticker")
-
-    if ticker and row.get("market_value_usd") is None:
-        px_info = fetch_eodhd_price(str(ticker), as_of=as_of or row.get("as_of_date"))
-        row["market_price"] = px_info.get("market_price")
-        row["price_as_of"] = px_info.get("price_as_of")
-        row["price_source"] = px_info.get("price_source")
-        if px_info.get("note"):
-            note = row.get("note") or ""
-            row["note"] = f"{note}; {px_info['note']}".strip("; ")
-
-        price = _f(row.get("market_price"))
-        if price is not None and shares is not None and shares > 0:
-            row["market_value_usd"] = price * shares
-            row["price_source"] = (row.get("price_source") or "eodhd") + "|shares*price"
-        elif ownership_pct is not None and ownership_pct > 0:
-            mcap = fetch_eodhd_market_cap(str(ticker))
-            if mcap is not None:
-                row["market_value_usd"] = mcap * (ownership_pct / 100.0)
-                row["price_source"] = (row.get("price_source") or "eodhd") + "|mcap*ownership_pct"
-                if row.get("note"):
-                    row["note"] = f"{row['note']}; mcap lookthrough"
-                else:
-                    row["note"] = "market_value via mcap * ownership_pct"
-
+    if row.get("market_value_usd") is None:
+        fv = row.get("fair_value_disclosed_usd")
+        if fv is None:
+            fv = row.get("carrying_usd")
+        if fv is not None:
+            row["market_value_usd"] = fv
     return apply_gaap_and_adj(row)
