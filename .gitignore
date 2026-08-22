@@ -1,0 +1,35 @@
+.env
+.env.*
+!.env.example
+
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.telemetry/
+.tmp_dagster_home_*/
+.dagster_home/
+storage/
+logs/
+
+# Local secrets / Google credentials
+*credentials*.json
+*service-account*.json
+google-sheets*.json
+
+# Large / generated local artifacts
+exports/
+*.csv
+!tests/**/*.csv
+backtest_report_data.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+.claude/

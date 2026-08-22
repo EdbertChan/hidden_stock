@@ -1,0 +1,5 @@
+load_from:
+  - grpc_server:
+      host: hidden_stock_code
+      port: 4000
+      location_name: hidden_stock

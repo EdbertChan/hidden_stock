@@ -1,0 +1,93 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: dagster
+      POSTGRES_PASSWORD: dagster
+      POSTGRES_DB: dagster
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    # Bound on all interfaces; restrict with ufw to localhost tunnels + Celery remotes
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dagster"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  hidden_stock_code:
+    build: .
+    command: ["dagster", "api", "grpc", "-h", "0.0.0.0", "-p", "4000", "-m", "hidden_stock.definitions"]
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: dagster
+      POSTGRES_PASSWORD: dagster
+      POSTGRES_DB: dagster
+      DAGSTER_CELERY_BROKER_URL: redis://redis:6379/0
+      DAGSTER_CELERY_BACKEND_URL: redis://redis:6379/0
+      DAGSTER_STORAGE_DIR: /tmp/dagster_storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  dagster_webserver:
+    build: .
+    command: ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000", "-w", "workspace.yaml"]
+    ports:
+      - "127.0.0.1:3000:3000"
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: dagster
+      POSTGRES_PASSWORD: dagster
+      POSTGRES_DB: dagster
+      DAGSTER_CELERY_BROKER_URL: redis://redis:6379/0
+      DAGSTER_CELERY_BACKEND_URL: redis://redis:6379/0
+      DAGSTER_STORAGE_DIR: /tmp/dagster_storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      hidden_stock_code:
+        condition: service_started
+      redis:
+        condition: service_healthy
+
+  dagster_daemon:
+    build: .
+    command: ["dagster-daemon", "run"]
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: dagster
+      POSTGRES_PASSWORD: dagster
+      POSTGRES_DB: dagster
+      DAGSTER_CELERY_BROKER_URL: redis://redis:6379/0
+      DAGSTER_CELERY_BACKEND_URL: redis://redis:6379/0
+      DAGSTER_STORAGE_DIR: /tmp/dagster_storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      hidden_stock_code:
+        condition: service_started
+      redis:
+        condition: service_healthy
+
+volumes:
+  pg_data:
