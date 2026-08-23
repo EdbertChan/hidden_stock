@@ -61,16 +61,15 @@ Depth is **calendar years** (`history_lookback_years`), not filing count. `histo
 
 ## Tabs
 
-`positions_qoq`, `current_holdings`, `portfolio_by_period`, `chart_data` (+ stacked column chart; **one column per ticker — never `OTHER`**), plus estimated performance tabs:
+`positions_qoq`, `current_holdings`, `portfolio_by_period`, `holdings_qoq_chart` (+ stacked column chart; **one column per ticker — never `OTHER`**), plus estimated performance tabs:
 
-- `returns_by_period` — portfolio MV, net external flow, **MTM** (primary), avg-cost + FIFO disposal estimates, Modified Dietz
-- `realized_pnl_qoq` — disposal events with `cost_method=avg|fifo` (avg is primary; FIFO sensitivity)
+- `holdings_qoq_chart`: **calendar quarter-ends** named sizing (broker `$` / `mark_at_filing_est_usd`; `basis=display_estimate_or_broker; not_portfolio_sot`). Not every 13G filing date. Do **not** star `PRIV_HK_*` on that stack. Own tab with chart at top — not buried under `chart_data`. UBER-style 13F parents still chart disclosed `$` on calendar quarters. Dietz / `portfolio_by_period` stay on portfolio SoT (Note 22 for TCEHY). `fanout_13g_hk` default lookback **8** years.
+- `returns_by_period` — portfolio MV, net external flow, **MTM** (primary), avg-cost + FIFO disposal estimates, Modified Dietz; **Dietz combo chart embeds here** (`dietz_return_pct` + `cum_dietz_growth`; estimated linked Dietz / CAGR subtitle)
+- `realized_pnl_qoq` — disposal events with `cost_method=avg|fifo` (avg is primary; FIFO sensitivity). No separate realized chart tabs (empty/zero for 13G-null-`$` parents).
 - `holding_returns` — per ticker × period weight, Dietz, contribution, MTM, avg/FIFO realized
 - `reported_vs_est` — BABA curated Interest and investment income vs summed calendar MTM (reconciliation; residual expected)
-- `returns_chart` — combo chart of QoQ Dietz % + cumulative growth index; CAGR footer/subtitle (estimated linked Dietz)
-- `realized_chart` — combo chart of QoQ avg-cost realized ($M) + cumulative realized ($M); estimated disposal, not GAAP
-- `realized_by_ticker_chart` — column chart of total estimated avg-cost realized ($M) by ticker (windowed; tiny tails dropped)
 
+Thin `chart_data` / `returns_chart` / `realized_chart` / `realized_by_ticker_chart` tabs are **removed**.
 ## Estimated P&L / returns (not tax or GAAP)
 
 Form 13F / Investments FV give **period-end shares + market value**, not purchase price or tax-lot cost.

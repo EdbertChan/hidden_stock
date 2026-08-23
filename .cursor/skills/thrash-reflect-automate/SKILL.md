@@ -1,17 +1,22 @@
 ---
 name: thrash-reflect-automate
 description: >-
-  On holdings swarm FAIL / NEEDS_WORK, test thrash, or /thrash: auto-run short
-  /reflect, fix the class (not only the named ticker), codify the invariant,
-  short /automate-me catch, then re-grade. Collapse phrase for “reflect and
-  automate after every failure” — do not wait for the user to re-prompt.
+  On holdings sheet-swarm or pipeline-swarm FAIL / NEEDS_WORK, test thrash, or
+  /thrash: auto-run short /reflect, fix the class (not only the named ticker),
+  codify the invariant, short /automate-me catch, then re-grade. Collapse phrase
+  for “reflect and automate after every failure” — do not wait for the user to
+  re-prompt.
 ---
 
 # Thrash → reflect + automate (no re-prompt)
 
-When a **swarm grade**, **test thrash**, or **FAIL / NEEDS_WORK board** happens
-in this repo — or the user says **`/thrash`** — do **not** wait for the long
-“after every failure /reflect and /automate-me” phrase.
+When a **swarm grade**, **pipeline-swarm** board, **test thrash**, or
+**FAIL / NEEDS_WORK board** happens in this repo — or the user says
+**`/thrash`** — do **not** wait for the long “after every failure /reflect and
+/automate-me” phrase.
+
+Triggers include `holdings-sheet-swarm-grade` **and**
+`pipeline-swarm-validate` / `scripts/swarm_validate_pipeline.py` boards.
 
 Companion always-on rule: `.cursor/rules/thrash-reflect-automate.mdc`.
 
@@ -23,8 +28,10 @@ Companion always-on rule: `.cursor/rules/thrash-reflect-automate.mdc`.
 3. **Codify** the invariant in the relevant skill when holdings-related
    (`holdings-sheet-swarm-grade`, `equity-holdings-sheets`, principles).
 4. **/automate-me** (short): one concrete automation that would catch this next
-   time (CI grade gate, mechanical check in `grade_holdings_sheet.py`, Cursor
-   Automation draft). Do not open the Automations editor unless the user asks.
+   time (CI grade gate, `swarm_validate_pipeline.py` stage, mechanical check in
+   `grade_holdings_sheet.py` / `broker_sotp_validate.py`, Cursor Automation
+   draft). Prefer the board’s `avoid_next_time` when present. Do not open the
+   Automations editor unless the user asks.
 5. Re-export / re-grade if that was the active loop; do not claim PASS without
    a new board.
 
@@ -33,7 +40,8 @@ Companion always-on rule: `.cursor/rules/thrash-reflect-automate.mdc`.
 | Shortcut | Means |
 |---|---|
 | `/thrash` | Run the auto sequence above |
-| swarm FAIL / NEEDS_WORK | Same — no extra prompt needed |
+| sheet-swarm FAIL / NEEDS_WORK | Same — no extra prompt needed |
+| pipeline-swarm FAIL / NEEDS_WORK | Same — use board `recommended_fixes` / `root_cause_class` / `avoid_next_time` |
 
 ## Do not
 
