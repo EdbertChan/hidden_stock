@@ -4,12 +4,15 @@ from __future__ import annotations
 
 
 def _f(v) -> float | None:
-    if v is None:
+    if v is None or v == "":
         return None
     try:
-        return float(v)
+        x = float(v)
     except (TypeError, ValueError):
         return None
+    if x != x:  # NaN
+        return None
+    return x
 
 
 def looks_like_ownership_pct_as_shares(shares_held, ownership_pct) -> bool:
@@ -59,4 +62,54 @@ def assert_live_shares_held_sane(rows: list[dict], *, context: str = "live") -> 
             f"{context}: ownership_% stuffed into shares_held "
             f"(Neutron-class; leave shares null, keep ownership_pct): "
             + "; ".join(bad[:10])
+        )
+
+
+def assert_estimates_not_in_market_value(rows: list[dict], *, context: str = "") -> None:
+    """Refuse-to-ship: EOD filing estimates must not pollute market_value_usd."""
+    bad: list[dict] = []
+    for r in rows:
+        note = str(r.get("note") or "")
+        has_est_cols = (
+            _f(r.get("cost_basis_est_usd")) is not None
+            or _f(r.get("mark_at_filing_est_usd")) is not None
+        )
+        if "value_estimate=eod_at_filing" not in note and not has_est_cols:
+            continue
+        if has_est_cols and "excluded_from_portfolio_mv" not in note:
+            bad.append(
+                {
+                    "ticker": r.get("investee_ticker"),
+                    "period_end": r.get("period_end") or r.get("as_of_date"),
+                    "issue": "estimate_missing_excluded_from_portfolio_mv",
+                }
+            )
+        mv = _f(r.get("market_value_usd"))
+        if mv is None:
+            continue
+        if "value_estimate=eod_at_filing" not in note:
+            continue
+        has_real = any(
+            x in note
+            for x in (
+                "value_source=broker_sotp",
+                "value_source=13f",
+                "value_source=hk_annual_note22",
+                "source=13f",
+                "investments_table",
+            )
+        )
+        if not has_real:
+            bad.append(
+                {
+                    "ticker": r.get("investee_ticker"),
+                    "period_end": r.get("period_end") or r.get("as_of_date"),
+                    "market_value_usd": mv,
+                    "issue": "eod_estimate_as_market_value",
+                }
+            )
+    if bad:
+        raise AssertionError(
+            f"EOD filing estimates leaked into market_value_usd / missing exclusion "
+            f"({context}): {bad[:8]}"
         )

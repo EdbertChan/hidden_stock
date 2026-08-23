@@ -1,0 +1,33 @@
+Figure 7: Tencent: valuation of strategic investments
+Name Ticker Tencent's stake % Mkt cap (US$mn) Value to Tencent (HK$mn)
+PDD Holdings Inc PDD US 13.8 136,262 146,672
+Sea Ltd SE US 18.2 58,811 83,488
+Spotify Technology SA SPOT US 8.4 89,074 58,361
+Kuaishou Technology 1024 HK 15.8 28,627 35,257
+Futu Holdings Ltd FUTU US 14.9 19,211 22,327
+KE Holdings Inc BEKE US 11.4 21,619 19,224
+Reddit Inc RDDT US 6.7 29,329 15,419
+Zhejiang Century Huatong Group 002602 CH 10.0 16,233 12,700
+Snap Inc SNAP US 14.5 9,197 10,402
+Meituan 3690 HK 1.7 69,527 9,328
+Krafton Inc 259960 KS 13.5 8,642 9,093
+JD.com Inc 9618 HK 2.5 44,210 8,621
+Tongcheng Travel Holdings Ltd 780 HK 20.5 5,242 8,374
+Bilibili Inc 9626 HK 10.5 9,186 7,524
+Yixin Group Ltd 2858 HK 53.9 1,613 6,777
+Warner Music Group Corp WMG US 4.9 17,526 6,726
+Vipshop Holdings Ltd VIPS US 11.8 6,998 6,441
+J&T Global Express Ltd 1519 HK 6.1 10,718 5,075
+XtalPi Holdings Ltd 2228 HK 12.9 4,854 4,888
+Kanzhun Ltd BZ US 8.3 6,865 4,445
+Netmarble Corp 251270 KS 17.5 2,316 3,166
+Tuhu Car Inc 9690 HK 21.4 1,503 2,510
+Kadokawa Corp 9468 JP 6.9 3,339 1,787
+Other listed entities as a whole 64,745 16,627
+Listed investments (current value) 505,229
+Unlisted investments (book value) 419,616
+Total investment value 924,845
+Holdco discount 30%
+Valuation of strategic investments 647,391
+Source: Bloomberg, company data, CMBIGM
+Note: data as of the market close on 12 May

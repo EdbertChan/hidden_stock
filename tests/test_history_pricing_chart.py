@@ -30,11 +30,25 @@ def test_price_history_rows_exit_forced_zero():
             "investee_ticker": "FOO",
             "market_value_usd": None,
             "action": "exit",
-            "note": "source=13g",
+            "note": "source=13f",
         }
     ]
     out = price_history_rows(hist)
     assert out[0]["market_value_usd"] == 0.0
+
+
+def test_price_history_rows_exit_overlay_stays_null():
+    hist = [
+        {
+            "period_end": "2024-12-31",
+            "investee_ticker": "FOO",
+            "market_value_usd": None,
+            "action": "exit",
+            "note": "source=13g",
+        }
+    ]
+    out = price_history_rows(hist)
+    assert out[0]["market_value_usd"] is None
 
 
 def test_portfolio_omits_null_market_value_not_zero():

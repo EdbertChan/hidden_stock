@@ -3,36 +3,18 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
 from xml.etree import ElementTree as ET
 
-import yaml
-
 from .extract import load_investee_aliases, resolve_investee_ticker
+from .identity import load_cusip_tickers  # re-export for callers
 
 INFO_TABLE_NS = "http://www.sec.gov/edgar/document/thirteenf/informationtable"
 
-# Seed CUSIP → ticker for known BABA/common 13F names (never invent at runtime).
-_DEFAULT_CUSIP_TICKERS = {
-    "98422D105": "XPEV",  # XPeng ADS
-    "948596101": "WB",  # Weibo ADR
-}
+__all__ = ["load_cusip_tickers", "parse_13f_infotable_xml"]
 
 
 def _local(tag: str) -> str:
     return tag.split("}")[-1] if "}" in tag else tag
-
-
-def load_cusip_tickers(path: Path | None = None) -> dict[str, str]:
-    out = dict(_DEFAULT_CUSIP_TICKERS)
-    if path is None:
-        path = Path(__file__).resolve().parent / "cusip_tickers.yaml"
-    if path.exists():
-        data = yaml.safe_load(path.read_text()) or {}
-        for cusip, ticker in (data.get("cusips") or {}).items():
-            if cusip and ticker:
-                out[str(cusip).strip().upper()] = str(ticker).strip().upper()
-    return out
 
 
 def parse_13f_infotable_xml(

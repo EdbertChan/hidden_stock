@@ -7,6 +7,7 @@ import time
 from typing import Any
 from xml.etree import ElementTree as ET
 
+from .identity import holding_key as _key
 from .parse_notes import parse_investment_notes
 from .sec_api_13f import collect_filer_13f_periods
 
@@ -30,6 +31,17 @@ HISTORY_COLUMNS = [
     "first_seen_period",
     "exited_period",
     "note",
+    # HK composition overlay (first-class; also mirrored in note for graders)
+    "composition_parent",
+    "composition_as_of",
+    "child_value_source",
+    "parent_aggregate_market_value_usd",
+    # 13G best-guess marks (never portfolio SoT / never market_value_usd)
+    "cost_basis_est_usd",
+    "cost_basis_est_price",
+    "cost_basis_est_as_of",
+    "cost_basis_est_source",
+    "mark_at_filing_est_usd",
 ]
 
 
@@ -58,25 +70,6 @@ def parse_13f_period_end(primary_doc_xml: str) -> str | None:
             if m:
                 return raw[:10]
     return None
-
-
-def _key(row: dict) -> str:
-    """Identity for QoQ diffs: ticker first, then CUSIP, then name.
-
-    Ticker-first matches live ``merge_raw_holdings`` and prevents 13F drop +
-    continuing 13G from emitting exit(c:CUSIP)+new(t:TICKER) for the same name
-    (Codex grade FAIL on SERV @ 2026-06-30).
-    """
-    from .lookback import normalize_ticker
-
-    t = normalize_ticker(row.get("investee_ticker")) or ""
-    if t:
-        return f"t:{t}"
-    c = (row.get("_cusip") or row.get("cusip") or "").strip().upper()
-    if c:
-        return f"c:{c}"
-    name = re.sub(r"[^a-z0-9]+", "", (row.get("investee_name") or "").lower())
-    return f"n:{name}"
 
 
 def classify_action(shares_prev: float | None, shares: float | None) -> str:
@@ -205,6 +198,58 @@ def _continuity_qty(row: dict | None) -> float:
     return 0.0
 
 
+def _ownership_pct(row: dict | None) -> float | None:
+    if not row or row.get("ownership_pct") is None:
+        return None
+    try:
+        return float(row["ownership_pct"])
+    except (TypeError, ValueError):
+        return None
+
+
+def _classify_units(
+    prev: dict | None,
+    cur: dict | None,
+) -> tuple[str, float | None, float | None, float | None]:
+    """Return (action, shares_held_out, shares_prev_out, shares_delta).
+
+    Never mix share counts with ownership_% in one compare — that fabricates
+    sell deltas when a later 13G amendment is %-only.
+    """
+    shares_prev = (
+        float(prev["shares_held"]) if prev and prev.get("shares_held") is not None else None
+    )
+    shares = float(cur["shares_held"]) if cur and cur.get("shares_held") is not None else None
+    pct_prev = _ownership_pct(prev)
+    pct = _ownership_pct(cur)
+
+    if prev is None and cur is not None:
+        return "new", shares, None, shares if shares is not None else None
+    if prev is not None and cur is None:
+        return "exit", 0.0, shares_prev, (0.0 - (shares_prev or 0.0)) if shares_prev is not None else None
+
+    # Both present.
+    if shares_prev is not None and shares is not None:
+        action = classify_action(shares_prev, shares)
+        return action, shares, shares_prev, shares - shares_prev
+    if pct_prev is not None and pct is not None:
+        action = classify_action(pct_prev, pct)
+        # %-only continuity: do not invent a share delta from mismatched units.
+        return action, shares, shares_prev, None
+    if shares is not None and shares_prev is None:
+        # First time we see a share count after %-only — not a buy of those shares.
+        return "hold", shares, None, None
+    if shares_prev is not None and shares is None:
+        # Amendment dropped share count; keep action on % when possible.
+        if pct_prev is not None and pct is not None:
+            action = classify_action(pct_prev, pct)
+        else:
+            action = "hold"
+        return action, None, shares_prev, None
+    # Neither side has comparable quantity.
+    return "hold", shares, shares_prev, None
+
+
 def _private_note_ticker(name: str | None) -> str:
     """Stable non-exchange identity for private 20-F note names (not a real ticker)."""
     slug = re.sub(r"[^a-z0-9]+", "_", (name or "").lower()).strip("_")
@@ -268,11 +313,19 @@ def note_as_position(raw: dict) -> dict:
 def diff_snapshots(
     parent_ticker: str,
     ordered_periods: list[tuple[str, str, str, list[dict]]],
+    *,
+    exit_events: dict[str, dict[str, str]] | None = None,
 ) -> list[dict]:
-    """ordered_periods: list of (period_end, filing_date, accession, rows) oldest→newest."""
+    """ordered_periods: list of (period_end, filing_date, accession, rows) oldest→newest.
+
+    ``exit_events`` maps investee ticker → {accession, filing_date} for the
+    explicit SC 13G/D filing that zeroed the stake (preferred over prior-hold
+    or sibling same-day bucket accessions).
+    """
     history: list[dict] = []
     prev_map: dict[str, dict] = {}
     first_seen: dict[str, str] = {}
+    exit_events = exit_events or {}
 
     for period_end, filing_date, accession, rows in ordered_periods:
         cur_map = {_key(r): r for r in rows if _key(r) not in {"t:", "c:", "n:"}}
@@ -281,36 +334,50 @@ def diff_snapshots(
         for k in sorted(keys):
             prev = prev_map.get(k)
             cur = cur_map.get(k)
-            qty_prev = _continuity_qty(prev)
-            qty = _continuity_qty(cur)
             value_prev = (
                 float(prev["market_value_usd"]) if prev and prev.get("market_value_usd") is not None else None
             )
             value = float(cur["market_value_usd"]) if cur and cur.get("market_value_usd") is not None else None
-            # Exported shares_held: real counts only — never ownership_%.
-            shares_prev = (
-                float(prev["shares_held"]) if prev and prev.get("shares_held") is not None else None
-            )
-            shares = float(cur["shares_held"]) if cur and cur.get("shares_held") is not None else None
 
             if prev is None and cur is None:
                 continue
-            if k not in first_seen and qty > 0:
-                first_seen[k] = period_end
 
-            action = classify_action(qty_prev if prev else 0.0, qty if cur else 0.0)
-            if prev is None and (cur is None or qty <= 0):
+            # Drop identity-less empty appears.
+            qty_cur = _continuity_qty(cur)
+            qty_prev = _continuity_qty(prev)
+            if prev is None and (cur is None or qty_cur <= 0):
                 continue
+
+            action, shares, shares_prev, shares_delta = _classify_units(prev, cur)
             if prev is None and cur is not None:
                 action = "new"
+
+            if k not in first_seen and (
+                (shares is not None and shares > 0)
+                or (qty_cur > 0)
+            ):
+                first_seen[k] = period_end
 
             name = (cur or prev or {}).get("investee_name")
             ticker = (cur or prev or {}).get("investee_ticker")
             cusip = (cur or prev or {}).get("_cusip") or (cur or prev or {}).get("cusip")
             src_note = (cur or prev or {}).get("note")
-            # Exits cite the period grid filing (when the name disappeared), not the prior hold.
+            src_l = str(src_note or "").lower()
+            is_overlay = any(
+                x in src_l for x in ("source=13g", "20f_note", "10k_note", "10q_note", "ticker=private_note")
+            )
+            # Exits: prefer the explicit zeroing 13G/D accession (exit_events).
+            # Else 13F period-grid accession. Overlay inferred disappearances
+            # without an exit event keep the prior-hold accession (sibling-
+            # filing steal guard for multi-issuer same-day buckets).
             if action == "exit":
-                support_acc = accession or (prev or {}).get("as_of_accession_no")
+                ev = exit_events.get(str(ticker or "").strip().upper()) if ticker else None
+                if ev and ev.get("accession"):
+                    support_acc = ev["accession"]
+                elif is_overlay:
+                    support_acc = (prev or {}).get("as_of_accession_no") or accession
+                else:
+                    support_acc = accession or (prev or {}).get("as_of_accession_no")
             else:
                 support_acc = (
                     (cur or {}).get("as_of_accession_no")
@@ -321,23 +388,63 @@ def diff_snapshots(
             exited_period = period_end if action == "exit" else None
             out_shares = 0.0 if action == "exit" else shares
             out_shares_prev = shares_prev if prev is not None else None
-            if action == "exit":
-                shares_delta = 0.0 - (shares_prev or 0.0)
-            elif shares is not None or shares_prev is not None:
-                shares_delta = (shares or 0.0) - (shares_prev or 0.0)
-            else:
-                shares_delta = None
+            if action == "exit" and shares_delta is None and shares_prev is not None:
+                shares_delta = 0.0 - shares_prev
             # 13G/note overlays keep their own as_of filing_date (not the 13F grid date).
-            src_l = str(src_note or "").lower()
-            is_overlay = any(
-                x in src_l for x in ("source=13g", "20f_note", "10k_note", "10q_note", "ticker=private_note")
-            )
             row_filing = filing_date
             if is_overlay and action != "exit":
                 row_filing = (
                     (cur or {}).get("as_of_date")
                     or (prev or {}).get("as_of_date")
                     or filing_date
+                )
+            elif is_overlay and action == "exit":
+                ev = exit_events.get(str(ticker or "").strip().upper()) if ticker else None
+                if ev and ev.get("filing_date"):
+                    row_filing = ev["filing_date"]
+                else:
+                    # Inferred: keep prior hold as_of so accession/date match.
+                    row_filing = (
+                        (prev or {}).get("as_of_date")
+                        or filing_date
+                    )
+            note_out = src_note or f"QoQ {period_end}"
+            if action == "exit" and is_overlay:
+                ev = exit_events.get(str(ticker or "").strip().upper()) if ticker else None
+                if ev and ev.get("accession"):
+                    if "13g_exit=1" not in str(note_out) and "exit_reason=mna" not in str(
+                        note_out
+                    ):
+                        extra = ev.get("note") or "13g_exit=1"
+                        note_out = f"{note_out}; {extra}".strip("; ")
+                elif "exit_inferred=missing_from_period" not in str(note_out):
+                    note_out = f"{note_out}; exit_inferred=missing_from_period".strip("; ")
+            if (
+                shares_delta is None
+                and action in {"buy", "sell", "hold"}
+                and (shares is None or shares_prev is None)
+                and _ownership_pct(prev) is not None
+                and _ownership_pct(cur) is not None
+                and "qoq_continuity=ownership_pct" not in str(note_out)
+            ):
+                note_out = f"{note_out}; qoq_continuity=ownership_pct".strip("; ")
+            # 13G/note overlays never invent exit $ — null, not 0.0.
+            if action == "exit" and is_overlay and value is None and value_prev is None:
+                out_mv: float | None = None
+                out_vd: float | None = None
+            elif action == "exit":
+                out_mv = 0.0
+                out_vd = (
+                    None
+                    if value is None and value_prev is None
+                    else (0.0 - (value_prev or 0.0))
+                )
+            else:
+                out_mv = value
+                out_vd = (
+                    None
+                    if value is None and value_prev is None
+                    else (value or 0.0) - (value_prev or 0.0)
                 )
             history.append(
                 {
@@ -350,19 +457,15 @@ def diff_snapshots(
                     "investee_ticker": ticker,
                     "cusip": cusip,
                     "shares_held": out_shares,
-                    "market_value_usd": value if action != "exit" else 0.0,
+                    "market_value_usd": out_mv,
                     "shares_prev": out_shares_prev,
                     "shares_delta": shares_delta,
                     "value_prev": value_prev,
-                    "value_delta": (
-                        None
-                        if value is None and value_prev is None
-                        else (0.0 if action == "exit" else (value or 0.0)) - (value_prev or 0.0)
-                    ),
+                    "value_delta": out_vd,
                     "action": action,
                     "first_seen_period": first_seen.get(k),
                     "exited_period": exited_period,
-                    "note": src_note or f"QoQ {period_end}",
+                    "note": note_out,
                     # Exit means zero economic interest — never carry prior ownership_%.
                     "ownership_pct": (
                         0.0
@@ -725,7 +828,8 @@ def price_history_rows(history: list[dict]) -> list[dict]:
     """Normalize QoQ rows for export — never invent stake $ via OTC×shares.
 
     Valuation order is enforced upstream: 13F market_value → Investments-table
-    FV → else leave null (omit from chart). Exits are forced to 0.
+    FV → else leave null (omit from chart). 13F exits with a prior $ go to 0;
+    13G/note overlay exits stay null (no invent).
     """
     from .lookback import coalesce_period_ticker
 
@@ -733,7 +837,21 @@ def price_history_rows(history: list[dict]) -> list[dict]:
     for r in coalesce_period_ticker(history):
         row = dict(r)
         if str(row.get("action") or "") == "exit":
-            row["market_value_usd"] = 0.0
+            note = str(row.get("note") or "").lower()
+            is_overlay = any(
+                x in note
+                for x in (
+                    "source=13g",
+                    "20f_note",
+                    "10k_note",
+                    "10q_note",
+                    "ticker=private_note",
+                )
+            )
+            if is_overlay and row.get("market_value_usd") in (None, ""):
+                row["market_value_usd"] = None
+            else:
+                row["market_value_usd"] = 0.0
         out.append(row)
     return out
 
@@ -837,14 +955,14 @@ def build_holdings_history(
     if max_annual_filings is None:
         max_annual_filings = max(12, int(lookback_years) * 4)
 
-    # HK aggregate parents: 13G/D timeline (+ existing Tencent builder for live; history = 13G)
+    # HK aggregate parents: 13G/D timeline + HKEX annual Note 22 aggregates
     if uses_hk_aggregates(parent):
         from .tencent import build_13g_reporter_history
 
         hist, meta = build_13g_reporter_history(
             parent_ticker=parent,
             user_agent=ua,
-            max_filings=max(max_filings, 80),
+            max_filings=max(max_filings, 120),
             lookback_start=start,
         )
         meta["strategy"] = strategy
