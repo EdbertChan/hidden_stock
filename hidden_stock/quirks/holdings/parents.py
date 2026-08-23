@@ -51,3 +51,8 @@ def history_strategy(parent: str) -> str:
     if uses_hk_aggregates(parent):
         return "fanout_13g_hk"
     return "fanout_13f_13g_notes"
+
+
+def default_lookback_years(parent: str) -> int:
+    """Match CLI export: HK 13G/Note22 parents need a longer sparse window."""
+    return 8 if history_strategy(parent) == "fanout_13g_hk" else 5

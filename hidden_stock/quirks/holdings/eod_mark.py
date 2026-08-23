@@ -14,6 +14,35 @@ from .mtm import fetch_eodhd_price
 
 _EXCHANGE_SUFFIX_ONLY = frozenset({"US", "HK", "KS", "JP", "CH", "LN", "SS", "SZ"})
 
+# Ordinary shares per one ADS when 13G reports ordinary and EOD is US ADS.
+# Without this, marks invent 2–25× (MOGU/PDD/FUTU/BEKE class).
+_ORDINARY_PER_ADS: dict[str, int] = {
+    "PDD": 4,
+    "FUTU": 8,
+    "BEKE": 3,
+    "TME": 2,
+    "JD": 2,
+    "MOGU": 25,
+    "BILI": 1,
+    "NIO": 1,
+    "XPEV": 2,
+    "LI": 2,
+    "IQ": 7,
+    "HUYA": 1,
+    "VIPS": 2,
+    "YMM": 2,
+    "KC": 15,
+}
+
+
+def _ads_equivalent_shares(ticker: str, shares: float) -> tuple[float, int | None]:
+    """Convert ordinary share counts to ADS-equivalent for US list prices."""
+    r = _ORDINARY_PER_ADS.get(ticker)
+    if r is None or r <= 1:
+        return shares, r
+    return shares / float(r), r
+
+
 _ESTIMATE_NOTE = (
     "value_estimate=eod_at_filing; not_fv_allocation; excluded_from_portfolio_mv"
 )
@@ -173,10 +202,12 @@ def apply_filing_mark_estimates(
             _carry_basis()
             continue
 
-        mark = shares * px
+        ads_shares, ads_ratio = _ads_equivalent_shares(t, shares)
+        mark = ads_shares * px
         row["mark_at_filing_est_usd"] = mark
         src = str(meta.get("price_source") or "eod")
         as_of = str(meta.get("price_as_of") or pe)[:10]
+        ratio_stamp = f"ads_ordinary_ratio={ads_ratio}" if ads_ratio and ads_ratio > 1 else ""
 
         if action == "new" or t not in basis_by_ticker:
             row["cost_basis_est_usd"] = mark
@@ -198,11 +229,14 @@ def apply_filing_mark_estimates(
             row["cost_basis_est_source"] = b.get("cost_basis_est_source")
             role = "mark_at_filing"
 
-        row["note"] = append_composition_note(
-            row.get("note"),
-            f"{_ESTIMATE_NOTE}; estimate_role={role}; "
+        note_bits = [
+            _ESTIMATE_NOTE,
+            f"estimate_role={role}",
             f"cost_basis_est_source={row.get('cost_basis_est_source')}",
-        )
+        ]
+        if ratio_stamp:
+            note_bits.append(ratio_stamp)
+        row["note"] = append_composition_note(row.get("note"), "; ".join(note_bits))
         out[orig_i] = row
 
     return out

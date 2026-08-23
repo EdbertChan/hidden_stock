@@ -16,6 +16,7 @@ from ..quirks.holdings import (
     rollup_holdings,
 )
 from ..quirks.holdings.history import assert_unique_period_ticker
+from ..quirks.holdings.parents import default_lookback_years
 from ..quirks.holdings.validate import assert_live_shares_held_sane, scrub_live_pct_as_shares
 from ..resources.db_resource import DBResource
 from ..resources.edgar_resource import EdgarResource
@@ -26,6 +27,13 @@ TABLE = "equity_holdings"
 BACKTEST_TABLE = "backtest_equity_holdings"
 PARENT_ROLLUP_TABLE = "equity_holdings_parent_rollups"
 HISTORY_TABLE = "equity_holdings_history"
+
+
+def _resolve_lookback_years(settings: EquityHoldingsSettings, parent: str) -> int:
+    """Forced resource lookback, else per-parent default (TCEHY=8)."""
+    if settings.history_lookback_years is not None:
+        return int(settings.history_lookback_years)
+    return int(default_lookback_years(parent))
 
 
 def _ensure_table(engine, table: str) -> None:
@@ -246,7 +254,7 @@ def equity_holdings(
         {
             "num_holdings_rows": len(holdings_df),
             "num_parents": int(roll_df["ticker"].nunique()) if len(roll_df) else 0,
-            "lookback_years": int(settings.history_lookback_years),
+            "lookback_years": settings.history_lookback_years,
             "num_with_book_adj": int(
                 (pd.to_numeric(roll_df.get("holdings_book_adj_usd"), errors="coerce").fillna(0) != 0).sum()
             )
@@ -273,16 +281,19 @@ def equity_holdings_history(
         )
     tickers = [normalize_parent(t) for t in settings.ticker_allowlist]
     all_rows: list[dict] = []
+    lookbacks: dict[str, int] = {}
     for t in tickers:
+        lb = _resolve_lookback_years(settings, t)
+        lookbacks[t] = lb
         rows, meta = build_holdings_history(
             parent_ticker=t,
             edgar=edgar,
             max_filings=int(settings.history_max_filings),
-            lookback_years=int(settings.history_lookback_years),
+            lookback_years=lb,
         )
         context.log.info(
             f"{t}: strategy={meta.get('strategy')} lookback={meta.get('lookback_start')} "
-            f"periods={meta.get('num_periods')} filings={meta.get('num_filings')} "
+            f"years={lb} periods={meta.get('num_periods')} filings={meta.get('num_filings')} "
             f"note_snaps={meta.get('num_note_snapshots')} rows={len(rows)} err={meta.get('error')}"
         )
         all_rows.extend(rows)
@@ -303,7 +314,7 @@ def equity_holdings_history(
             "num_sells": sells,
             "num_buys_or_new": buys,
             "periods": int(df["period_end"].nunique()) if len(df) else 0,
-            "lookback_years": int(settings.history_lookback_years),
+            "lookback_years": lookbacks,
             "period_min": str(df["period_end"].min()) if len(df) else None,
             "period_max": str(df["period_end"].max()) if len(df) else None,
         }
@@ -372,7 +383,7 @@ def equity_holdings_export(
         {
             "num_parents": len(results),
             "export_dir": str(out_dir),
-            "lookback_years": int(settings.history_lookback_years),
+            "lookback_years": settings.history_lookback_years,
             "spreadsheet_ids": [
                 r.get("sheets", {}).get("spreadsheet_id") for r in results if r.get("sheets")
             ],

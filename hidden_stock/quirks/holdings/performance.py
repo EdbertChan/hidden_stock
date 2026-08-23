@@ -557,6 +557,13 @@ def holding_period_returns(
             continue
         t = _ticker_key(r)
         pe = str(r.get("period_end") or "")
+        try:
+            from .composition import excluded_from_portfolio_mv, is_hk_residual_ticker
+
+            if excluded_from_portfolio_mv(r) or is_hk_residual_ticker(t):
+                continue
+        except Exception:
+            pass
         mv = _f(r.get("market_value_usd"))
         if not t or not pe or mv is None:
             continue

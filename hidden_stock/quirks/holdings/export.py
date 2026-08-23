@@ -33,7 +33,6 @@ SHEET_REPORTED_VS_EST = "reported_vs_est"
 # Sheets already scaled to $ millions (not raw USD).
 _SHEETS_IN_MILLIONS = frozenset(
     {
-        SHEET_PORTFOLIO,
         SHEET_HOLDINGS_QOQ_CHART,
     }
 )
@@ -251,8 +250,15 @@ def portfolio_by_period_frame(hist: pd.DataFrame) -> pd.DataFrame:
 def display_stack_by_period_frame(hist: pd.DataFrame) -> pd.DataFrame:
     """Named QoQ sizing for chart display — not portfolio / Dietz SoT.
 
-    Prefer disclosed/broker ``market_value_usd`` (even when excluded from portfolio),
-    else ``mark_at_filing_est_usd``. Skips ``PRIV_*``, residuals, exits. Never invents.
+    Prefer a **stable** series so calendar quarters do not cliff when broker
+    overlays land:
+
+    1. ``mark_at_filing_est_usd`` (EOD×shares at filing)
+    2. else non-broker ``market_value_usd`` (13F / disclosed)
+    3. else broker ``market_value_usd`` (last resort)
+
+    Mixing (2)/(3) ahead of (1) caused PDD 2023-03 / 2026-06 display cliffs.
+    Skips ``PRIV_*``, residuals, exits. Never invents.
     """
     cols = ["period_end", "investee_ticker", "display_value_usd"]
     if hist is None or hist.empty:
@@ -283,7 +289,17 @@ def display_stack_by_period_frame(hist: pd.DataFrame) -> pd.DataFrame:
         if "mark_at_filing_est_usd" in df.columns
         else pd.Series(float("nan"), index=df.index)
     )
-    df["display_value_usd"] = mv.where(mv.notna(), mark)
+    if "note" in df.columns:
+        note = df["note"].fillna("").astype(str)
+    else:
+        note = pd.Series("", index=df.index, dtype=str)
+    is_broker = note.str.contains("value_source=broker_sotp", regex=False)
+    disclosed = mv.where(~is_broker)
+    broker = mv.where(is_broker)
+    df["display_value_usd"] = mark.where(mark.notna(), disclosed)
+    df["display_value_usd"] = df["display_value_usd"].where(
+        df["display_value_usd"].notna(), broker
+    )
     df = df[df["display_value_usd"].notna()].copy()
     if df.empty:
         return pd.DataFrame(columns=cols)
@@ -372,13 +388,22 @@ def quarterly_display_stack_frame(hist: pd.DataFrame) -> pd.DataFrame:
 
     pe_min = str(disp["period_end"].astype(str).min())[:10]
     pe_max = str(disp["period_end"].astype(str).max())[:10]
-    pe_max_q = (pd.Timestamp(pe_max) + pd.offsets.QuarterEnd(0)).strftime("%Y-%m-%d")
+    today = pd.Timestamp.today().normalize()
+    # Last *closed* calendar quarter-end on or before today (never invent the
+    # in-progress quarter — pandas QuarterEnd(0) rolls *forward*).
+    closed = pd.date_range(end=today, periods=1, freq="QE")
+    last_closed = closed[0] if len(closed) else today
+    # Extend pe_max to its containing quarter-end, then clamp to last_closed.
+    data_q = pd.Timestamp(pe_max) + pd.offsets.QuarterEnd(0)
+    pe_cap = min(data_q, last_closed)
+    pe_min_ts = min(pd.Timestamp(pe_min), pe_cap)
     try:
-        q_ends = pd.date_range(start=pe_min, end=pe_max_q, freq="QE")
+        q_ends = pd.date_range(start=pe_min_ts, end=pe_cap, freq="QE")
     except ValueError:
-        q_ends = pd.date_range(start=pe_min, end=pe_max_q, freq="Q")
+        q_ends = pd.date_range(start=pe_min_ts, end=pe_cap, freq="Q")
+    q_ends = q_ends[q_ends <= last_closed]
     if len(q_ends) == 0:
-        q_ends = pd.DatetimeIndex([pd.Timestamp(pe_max_q)])
+        q_ends = pd.DatetimeIndex([last_closed])
 
     disp = disp.sort_values(["investee_ticker", "period_end"], kind="mergesort")
     out_rows: list[dict] = []
@@ -445,7 +470,7 @@ def holdings_qoq_chart_frame(
     synth["action"] = "hold"
     synth["market_value_usd"] = port["market_value_usd"]
     q2 = quarterly_display_stack_frame(synth)
-    # quarterly_display_stack uses display_stack which prefers market_value — OK
+    # quarterly_display_stack prefers mark_at_filing_est; synth sets both — OK
     if q2.empty:
         wide = _wide_stack_chart(
             port,
@@ -675,6 +700,14 @@ def _df_to_rows(df: pd.DataFrame) -> list[list[Any]]:
 def _number_format_for_column(col: str, *, sheet: str) -> str | None:
     """Google Sheets numberFormat pattern for a column (display only)."""
     c = str(col)
+    # Returns Dietz columns are unitless fractions / already-*100 — never append "%".
+    if sheet == SHEET_RETURNS and c in {
+        "dietz_return",
+        "dietz_return_pct",
+        "cum_dietz_growth",
+        "cum_growth_index",
+    }:
+        return "0.00"
     if sheet in _SHEETS_IN_MILLIONS:
         if c in {"period_end", "investee_ticker", "investee_name"}:
             return None
@@ -688,8 +721,6 @@ def _number_format_for_column(col: str, *, sheet: str) -> str | None:
         return "#,##0"
     if _MN_COL.search(c):
         return "#,##0.0"
-    if sheet == SHEET_RETURNS and c in {"dietz_return_pct", "cum_dietz_growth"}:
-        return "0.00"
     return None
 
 

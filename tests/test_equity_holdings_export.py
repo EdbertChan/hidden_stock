@@ -221,23 +221,75 @@ def test_display_stack_uses_mark_est_skips_priv_aggregates():
     assert set(port["investee_ticker"]) == {"PRIV_HK_LISTED_INVESTEES_FV"}
 
 
-def test_holdings_qoq_chart_defaults_to_top_7():
-    rows = []
-    for i, t in enumerate(["A", "B", "C", "D", "E", "F", "G", "H", "I"]):
-        rows.append(
+def test_display_stack_prefers_eod_mark_over_broker_mv():
+    """Broker overlay must not cliff the continuous EOD display series (PDD 2023-03 class)."""
+    hist = pd.DataFrame(
+        [
             {
-                "period_end": "2025-09-30",
-                "investee_ticker": t,
+                "period_end": "2023-02-14",
+                "investee_ticker": "PDD",
                 "action": "hold",
                 "market_value_usd": None,
-                "mark_at_filing_est_usd": float((10 - i) * 1_000_000_000),
-            }
-        )
-    wide = holdings_qoq_chart_frame(pd.DataFrame(rows))
-    tickers = [c for c in wide.columns if c != "period_end"]
-    assert len(tickers) == 7
-    assert tickers == ["A", "B", "C", "D", "E", "F", "G"]
-    assert "H" not in tickers and "I" not in tickers
+                "mark_at_filing_est_usd": 80_000_000_000.0,
+                "note": "value_estimate=eod_at_filing; excluded_from_portfolio_mv",
+            },
+            {
+                "period_end": "2023-03-20",
+                "investee_ticker": "PDD",
+                "action": "hold",
+                "market_value_usd": 15_000_000_000.0,
+                "mark_at_filing_est_usd": 78_000_000_000.0,
+                "note": "value_source=broker_sotp; excluded_from_portfolio_mv",
+            },
+            {
+                "period_end": "2023-05-10",
+                "investee_ticker": "PDD",
+                "action": "hold",
+                "market_value_usd": None,
+                "mark_at_filing_est_usd": 82_000_000_000.0,
+                "note": "value_estimate=eod_at_filing; excluded_from_portfolio_mv",
+            },
+        ]
+    )
+    disp = display_stack_by_period_frame(hist)
+    by = {
+        str(r.period_end): float(r.display_value_usd)
+        for r in disp.itertuples()
+    }
+    assert by["2023-03-20"] == 78_000_000_000.0
+    q = quarterly_display_stack_frame(hist)
+    mar = q[(q.period_end == "2023-03-31") & (q.investee_ticker == "PDD")]
+    assert float(mar.iloc[0]["display_value_usd"]) == 78_000_000_000.0
+
+
+def test_quarterly_stack_excludes_future_quarters():
+    """Do not emit calendar quarters after the last closed quarter-end."""
+    today = pd.Timestamp.today().normalize()
+    last_closed = pd.date_range(end=today, periods=1, freq="QE")[0]
+    future_q = (last_closed + pd.offsets.QuarterEnd(1)).strftime("%Y-%m-%d")
+    past_q = last_closed.strftime("%Y-%m-%d")
+    hist = pd.DataFrame(
+        [
+            {
+                "period_end": past_q,
+                "investee_ticker": "AS",
+                "action": "hold",
+                "market_value_usd": None,
+                "mark_at_filing_est_usd": 100_000_000.0,
+            },
+            {
+                "period_end": future_q,
+                "investee_ticker": "AS",
+                "action": "hold",
+                "market_value_usd": None,
+                "mark_at_filing_est_usd": 110_000_000.0,
+            },
+        ]
+    )
+    q = quarterly_display_stack_frame(hist)
+    periods = set(q["period_end"].astype(str))
+    assert future_q not in periods
+    assert past_q in periods
 
 
 def test_quarterly_stack_collapses_filing_dates_not_selloff():

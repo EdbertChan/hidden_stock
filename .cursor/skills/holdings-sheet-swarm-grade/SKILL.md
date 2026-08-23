@@ -83,7 +83,9 @@ form parser). Do not hardcode HK Note 22 numbers in orchestration.
 19. **Nested HK aggregates:** listed-associates FV is a subset of all-listed-investees FV — never both in portfolio `$` (`nested_in=listed_investees_fv`).
 20. **HK composition overlay (TCEHY):** Portfolio `$` SoT = `PRIV_HK_*` Note 22 aggregates (`parent_aggregate_market_value_usd` on **positions_qoq**). Named children = SEC 13G/D. First-class `composition_parent` / `composition_as_of` (+ note mirror) — **PASS**. Inventing child `$` via shares×EOD into `market_value_usd` — **FAIL**. Broker `$` join with `child_value_source=broker_sotp` — **PASS**; never treat parent aggregate (~$90B) as PDD value-to-Tencent (~$10–40B). Residuals = `PRIV_HK_*_RESIDUAL` on QoQ with `excluded_from_portfolio_mv` — **no** separate `hk_composition` tab. `current_holdings` = open-positions slice of QoQ.
 21. **13G filing-date estimate:** `cost_basis_est_*` (at `action=new`) + `mark_at_filing_est_usd` (each period) via EOD×shares are **PASS** when stamped `value_estimate=eod_at_filing; excluded_from_portfolio_mv` and `market_value_usd` stays null. Putting that estimate into `market_value_usd` / portfolio — **FAIL**.
-22. **Display stack ≠ portfolio SoT:** `holdings_qoq_chart` stacks named broker `$` / `mark_at_filing_est_usd` on **calendar quarter-ends** (`basis=display_estimate_or_broker`) sorted by size — **PASS**. Filing-date x-axis thrash, treating that stack as Dietz / Note 22 SoT, or starring only `PRIV_HK_*` when named display values exist — **FAIL**.
+22. **Display stack ≠ portfolio SoT:** `holdings_qoq_chart` stacks named marks on **calendar quarter-ends ≤ today** (`basis=display_estimate_or_broker`) sorted by size — **PASS**. Preference: **`mark_at_filing_est_usd` → non-broker `$` → broker `$` last**. Preferring broker `$` over continuous EOD marks (PDD 2023-03 / 2026-06 cliffs) — **FAIL**. Filing-date x-axis thrash, future quarters, treating that stack as Dietz / Note 22 SoT, or starring only `PRIV_HK_*` when named display values exist — **FAIL**.
+23. **Holding returns** must exclude `PRIV_HK_*_RESIDUAL` / `excluded_from_portfolio_mv` — never double-count residual at weight 1.0 beside the parent aggregate.
+24. **ADS ordinary vs ADS price:** EOD estimates apply known ordinary-per-ADS ratios (`ads_ordinary_ratio=`); ordinary×ADS invent (MOGU $86B class) is **FAIL** when unscaled.
 
 Also see `/pipeline-swarm-validate` for stage-scoped mechanical + Fable/Codex boards (broker / overlay / composition).
 
@@ -104,6 +106,10 @@ PASS cannot hide invent on null-`$` rows:
 - 13G/note-overlay exit row (`note` contains `source=13g`/`20f_note`/`10k_note`/
   `10q_note`/`ticker=private_note`) with `market_value_usd == 0.0` → FAIL
   (`overlay_exit_invented_zero` — only a real 13F-sourced exit may be forced to 0.0)
+- `holdings_qoq_chart` QoQ drop >70% then rebound (display basis cliff) → FAIL
+  (`display_basis_cliff`)
+- blank `investee_ticker` on a named public investee (not `ticker=private_note`) → FAIL
+  (`blank_public_ticker`)
 
 ## After judgment (required)
 

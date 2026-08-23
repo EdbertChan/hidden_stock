@@ -465,6 +465,87 @@ def mechanical_precheck(
         checks.setdefault("no_share_invent", "unknown")
         checks.setdefault("no_placeholder_tickers", "unknown")
 
+    # Display-stack basis cliffs: broker $ preferred over EOD mark (PDD 2023-03 class).
+    chart_csv = history_csv.parent / history_csv.name.replace(
+        "_equity_holdings_history.csv", "_holdings_qoq_chart.csv"
+    )
+    checks.setdefault("no_display_basis_cliff", "unknown")
+    if chart_csv.is_file():
+        try:
+            chart = pd.read_csv(chart_csv)
+            cliff_hits: list[str] = []
+            if "period_end" in chart.columns and len(chart) >= 2:
+                chart = chart.sort_values("period_end", kind="mergesort")
+                tickers = [c for c in chart.columns if c != "period_end"]
+                for t in tickers:
+                    series = pd.to_numeric(chart[t], errors="coerce")
+                    for i in range(1, len(series)):
+                        a, b = series.iloc[i - 1], series.iloc[i]
+                        if pd.isna(a) or pd.isna(b) or a <= 0 or b <= 0:
+                            continue
+                        # Drop >70% then rebound next period → basis thrash, not a sale.
+                        if b < 0.3 * a:
+                            nxt = series.iloc[i + 1] if i + 1 < len(series) else None
+                            if nxt is not None and pd.notna(nxt) and nxt > 0.7 * a:
+                                pe = str(chart["period_end"].iloc[i])
+                                cliff_hits.append(f"{t}@{pe}: {a:.0f}→{b:.0f}→{nxt:.0f}")
+            if cliff_hits:
+                checks["no_display_basis_cliff"] = "fail"
+                checks["chart_ranking_sane"] = "fail"
+                issues.append(
+                    {
+                        "id": "display_basis_cliff",
+                        "severity": (
+                            "holdings_qoq_chart QoQ cliff then rebound "
+                            "(prefer mark_at_filing_est over broker market_value)"
+                        ),
+                        "evidence": cliff_hits[:8],
+                    }
+                )
+            else:
+                checks["no_display_basis_cliff"] = "pass"
+        except Exception as e:
+            checks["no_display_basis_cliff"] = "unknown"
+            issues.append(
+                {
+                    "id": "display_basis_cliff_check_error",
+                    "severity": f"could not scan chart CSV: {e}",
+                    "evidence": str(chart_csv),
+                }
+            )
+    else:
+        checks["no_display_basis_cliff"] = "n/a"
+
+    # Blank investee_ticker on named public rows (Bitauto / 58.com class).
+    checks.setdefault("no_blank_public_ticker", "unknown")
+    if "investee_ticker" in hist.columns and "investee_name" in hist.columns:
+        tcol = hist["investee_ticker"]
+        blank = tcol.isna() | (tcol.astype(str).str.strip() == "") | (
+            tcol.astype(str).str.upper().isin({"NAN", "NONE", "NAT"})
+        )
+        notes = hist["note"].astype(str) if "note" in hist.columns else ""
+        named = hist["investee_name"].fillna("").astype(str).str.strip() != ""
+        priv = notes.str.contains(r"ticker=private_note", case=False, regex=True, na=False)
+        bad_blank = blank & named & ~priv
+        if bad_blank.any():
+            sample = hist.loc[
+                bad_blank,
+                [c for c in ("period_end", "investee_name", "cusip", "action", "note") if c in hist.columns],
+            ].head(8)
+            issues.append(
+                {
+                    "id": "blank_public_ticker",
+                    "severity": (
+                        "blank investee_ticker on named public investee "
+                        "(stamp via CUSIP/alias — Bitauto/58.com class)"
+                    ),
+                    "evidence": sample.to_dict(orient="records"),
+                }
+            )
+            checks["no_blank_public_ticker"] = "fail"
+        else:
+            checks["no_blank_public_ticker"] = "pass"
+
     good = []
     if not issues:
         good.append(f"Mechanical uniqueness + invent checks passed for parent={parent_u}")
@@ -547,7 +628,17 @@ def build_packet(*, ticker: str, sheet_url: str | None, out_dir: Path) -> Path:
                 "show `series_break=coverage_basis` — that is PASS, not a fake cash FAIL.",
                 "HK composition: named 13G rows may stamp `composition_parent=PRIV_HK_*` "
                 "+ `not_fv_allocation` with null child `$` — PASS. Inventing child `$` "
-                "from shares×EOD is FAIL. `PRIV_HK_*_RESIDUAL` is excluded from portfolio MV.",
+                "into `market_value_usd` from shares×EOD is FAIL. "
+                "`PRIV_HK_*_RESIDUAL` is excluded from portfolio MV.",
+                "Broker SOTP child `$` in `market_value_usd` with "
+                "`value_source=broker_sotp` + `excluded_from_portfolio_mv` is **PASS** "
+                "(display / composition only — not Dietz / Note 22 SoT). Do **not** "
+                "FAIL merely because broker `$` exists outside 13F/Investments hierarchy.",
+                "13G EOD estimates: `mark_at_filing_est_usd` / `cost_basis_est_*` with "
+                "`value_estimate=eod_at_filing; excluded_from_portfolio_mv` and "
+                "**null** `market_value_usd` are **PASS**. Putting that estimate into "
+                "`market_value_usd` / portfolio is FAIL. Chart may stack marks + broker "
+                "on calendar quarters (`basis=display_estimate_or_broker`) — PASS.",
                 "",
             ]
         )

@@ -29,13 +29,12 @@ Invoke explicitly:
 2. **Auth** — service accounts have 0 Drive quota:
    - New experiment sheet: OAuth (`GOOGLE_SHEETS_OAUTH_*`) + `--new-sheet`
    - Reuse: share sheet with SA, set `GOOGLE_SHEETS_SPREADSHEET_ID`, `--reuse-sheet`
-3. **Run** — always refresh **live + history** together (history-only leaves stale invent `$` on `current_holdings`). Default `--lookback-years 5` is the **chart/portfolio window**; edge-held names sparsely walk earlier 13Fs for true `first_seen` / lot cost (never treat the window cut as inception). `--lookback-years 0` = no calendar cut (full book from 2000-01-01, still capped by `max_filings`).
+3. **Run** — always refresh **live + history** together (history-only leaves stale invent `$` on `current_holdings`). Default lookback is **per-parent** (`default_lookback_years`: 8 for `fanout_13g_hk` / TCEHY, else 5). Dagster `equity_holdings_settings.history_lookback_years=None` uses the same. Edge-held names sparsely walk earlier filings for true `first_seen` / lot cost. `--lookback-years 0` = no calendar cut (full book from 2000-01-01, still capped by `max_filings`).
 
 ```bash
 set -a && source .env && set +a
 python scripts/export_equity_holdings_sheets.py \
-  --ticker <RESOLVED> --live --history --new-sheet \
-  --lookback-years 5
+  --ticker <RESOLVED> --live --history --new-sheet
 ```
 
    Or Dagster — **one** shared resource block (not per-asset Config):
@@ -63,7 +62,7 @@ Depth is **calendar years** (`history_lookback_years`), not filing count. `histo
 
 `positions_qoq`, `current_holdings`, `portfolio_by_period`, `holdings_qoq_chart` (+ stacked column chart; **one column per ticker — never `OTHER`**), plus estimated performance tabs:
 
-- `holdings_qoq_chart`: **calendar quarter-ends**, **top 7** names by latest size (broker `$` / `mark_at_filing_est_usd`; `basis=display_estimate_or_broker; not_portfolio_sot`). Rest omitted (no OTHER). Not every 13G filing date. Own tab with chart at top. Dietz / `portfolio_by_period` stay on portfolio SoT. `fanout_13g_hk` default lookback **8** years.
+- `holdings_qoq_chart`: **calendar quarter-ends ≤ today**, **top 7** names by latest size. Display preference: **EOD `mark_at_filing_est_usd` → non-broker `$` → broker `$` last** (`basis=display_estimate_or_broker; not_portfolio_sot`). Rest omitted (no OTHER). Not every 13G filing date. Own tab with chart at top. Dietz / `portfolio_by_period` stay on portfolio SoT. `fanout_13g_hk` default lookback **8** years.
 - `returns_by_period` — portfolio MV, net external flow, **MTM** (primary), avg-cost + FIFO disposal estimates, Modified Dietz; **Dietz combo chart embeds here** (`dietz_return_pct` + `cum_dietz_growth`; estimated linked Dietz / CAGR subtitle)
 - `realized_pnl_qoq` — disposal events with `cost_method=avg|fifo` (avg is primary; FIFO sensitivity). No separate realized chart tabs (empty/zero for 13G-null-`$` parents).
 - `holding_returns` — per ticker × period weight, Dietz, contribution, MTM, avg/FIFO realized

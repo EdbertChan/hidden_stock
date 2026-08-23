@@ -477,7 +477,30 @@ def diff_snapshots(
 
         prev_map = cur_map
 
-    return reclassify_ads_ratio_adjustments(coalesce_history_by_period_ticker(history))
+    return reclassify_ads_ratio_adjustments(
+        coalesce_history_by_period_ticker(stamp_missing_investee_tickers(history))
+    )
+
+
+def stamp_missing_investee_tickers(history: list[dict]) -> list[dict]:
+    """Fill blank public tickers via CUSIP / alias / hints (Bitauto/58.com class).
+
+    Never leave a named public investee with empty ``investee_ticker``.
+    """
+    from .identity import resolve_issuer_ticker
+    from .lookback import normalize_ticker
+
+    for row in history:
+        if normalize_ticker(row.get("investee_ticker")):
+            continue
+        t = resolve_issuer_ticker(
+            row.get("investee_name"),
+            None,
+            cusip=row.get("cusip") or row.get("_cusip"),
+        )
+        if t:
+            row["investee_ticker"] = t
+    return history
 
 
 def coalesce_history_by_period_ticker(history: list[dict]) -> list[dict]:
