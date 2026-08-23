@@ -61,20 +61,24 @@ def stamp_missing_tickers(rows: list[dict]) -> list[dict]:
     and 13G XPeng merges onto 13F XPEV.
     """
     from .extract import load_investee_aliases, resolve_investee_ticker
-    from .parse_13f import load_cusip_tickers
+    from .identity import clean_issuer_name, load_cusip_tickers, resolve_issuer_ticker
 
     cusip_map = load_cusip_tickers()
     aliases = load_investee_aliases()
     out: list[dict] = []
     for r in rows:
         row = dict(r)
+        name = clean_issuer_name(row.get("investee_name")) or row.get("investee_name")
+        if name and name != row.get("investee_name"):
+            row["investee_name"] = name
         t = normalize_ticker(row.get("investee_ticker"))
         if not t:
             cusip = str(row.get("_cusip") or row.get("cusip") or "").strip().upper()
-            if cusip and cusip in cusip_map:
+            t = resolve_issuer_ticker(name, None, cusip=cusip or None)
+            if not t and cusip and cusip in cusip_map:
                 t = cusip_map[cusip]
-            else:
-                t = resolve_investee_ticker(row.get("investee_name"), None, aliases)
+            if not t:
+                t = resolve_investee_ticker(name, None, aliases)
             if t:
                 row["investee_ticker"] = t
         else:

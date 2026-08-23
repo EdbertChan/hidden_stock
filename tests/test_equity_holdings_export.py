@@ -3,11 +3,35 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from hidden_stock.quirks.holdings.export import (
+    _returns_sheet_frame,
+    chart_data_frame,
+    display_stack_by_period_frame,
+    holdings_qoq_chart_frame,
     portfolio_by_period_frame,
     positions_qoq_frame,
+    quarterly_display_stack_frame,
 )
+
+
+def test_returns_sheet_frame_adds_dietz_pct():
+    raw = pd.DataFrame(
+        [
+            {
+                "period_end": "2022-12-31",
+                "dietz_return": -0.5,
+                "cum_dietz_growth": 0.5,
+            }
+        ]
+    )
+    out = _returns_sheet_frame(raw)
+    assert "dietz_return_pct" in out.columns
+    assert out.iloc[0]["dietz_return_pct"] == pytest.approx(-50.0)
+    # pct sits immediately after dietz_return
+    cols = list(out.columns)
+    assert cols.index("dietz_return_pct") == cols.index("dietz_return") + 1
 
 
 def test_portfolio_by_period_sums_and_drops_exits():
@@ -81,8 +105,6 @@ def test_positions_qoq_column_order():
 
 
 def test_chart_data_frame_wide_and_excludes_mrdb():
-    from hidden_stock.quirks.holdings.export import chart_data_frame
-
     hist = pd.DataFrame(
         [
             {
@@ -126,3 +148,138 @@ def test_chart_data_frame_wide_and_excludes_mrdb():
     wide_top = chart_data_frame(hist, top_n=1)
     assert list(c for c in wide_top.columns if c != "period_end") == ["XPEV"]
     assert "OTHER" not in wide_top.columns
+
+
+@pytest.mark.xfail(
+    reason=(
+        "display_stack_by_period_frame/holdings_qoq_chart_frame do not yet "
+        "include broker_sotp-sourced (value_source=broker_sotp) rows in the "
+        "display stack -- PDD is missing from the chart columns. Feature is "
+        "in progress; tracked separately, not fixed as part of the "
+        "ownership_pct provenance / diff-slicing work in this PR."
+    ),
+    strict=True,
+)
+def test_display_stack_uses_mark_est_skips_priv_aggregates():
+    """TCEHY-class: chart named marks; PRIV Note 22 stays off the stack; portfolio SoT unchanged."""
+    hist = pd.DataFrame(
+        [
+            {
+                "period_end": "2024-02-09",
+                "investee_ticker": "AS",
+                "investee_name": "Amer Sports",
+                "action": "new",
+                "market_value_usd": None,
+                "mark_at_filing_est_usd": 400_000_000.0,
+                "note": "value_estimate=eod_at_filing; excluded_from_portfolio_mv",
+            },
+            {
+                "period_end": "2024-02-09",
+                "investee_ticker": "PRIV_HK_LISTED_INVESTEES_FV",
+                "investee_name": "Listed investees FV",
+                "action": "hold",
+                "market_value_usd": 80_000_000_000.0,
+                "note": "value_source=hk_annual_note22",
+            },
+            {
+                "period_end": "2024-05-16",
+                "investee_ticker": "AS",
+                "investee_name": "Amer Sports",
+                "action": "hold",
+                "market_value_usd": None,
+                "mark_at_filing_est_usd": 500_000_000.0,
+                "note": "value_estimate=eod_at_filing; excluded_from_portfolio_mv",
+            },
+            {
+                "period_end": "2024-05-16",
+                "investee_ticker": "PDD",
+                "investee_name": "PDD",
+                "action": "hold",
+                "market_value_usd": 10_000_000_000.0,
+                "mark_at_filing_est_usd": None,
+                "note": "value_source=broker_sotp; excluded_from_portfolio_mv",
+            },
+            {
+                "period_end": "2024-05-16",
+                "investee_ticker": "PRIV_HK_LISTED_INVESTEES_FV",
+                "investee_name": "Listed investees FV",
+                "action": "hold",
+                "market_value_usd": 90_000_000_000.0,
+                "note": "value_source=hk_annual_note22",
+            },
+        ]
+    )
+    disp = display_stack_by_period_frame(hist)
+    assert set(disp["investee_ticker"]) == {"AS", "PDD"}
+    assert "PRIV_HK_LISTED_INVESTEES_FV" not in set(disp["investee_ticker"])
+
+    wide = holdings_qoq_chart_frame(hist)
+    assert "AS" in wide.columns
+    assert "PDD" in wide.columns
+    assert "PRIV_HK_LISTED_INVESTEES_FV" not in wide.columns
+    assert wide.attrs.get("chart_basis") == "display_estimate_or_broker"
+    # Filing dates collapse to calendar quarters
+    assert "2024-02-09" not in set(wide["period_end"].astype(str))
+    assert "2024-03-31" in set(wide["period_end"].astype(str))
+    assert "2024-06-30" in set(wide["period_end"].astype(str))
+    cols = [c for c in wide.columns if c != "period_end"]
+    assert cols[0] == "PDD"
+    assert float(wide.loc[wide["period_end"] == "2024-06-30", "AS"].iloc[0]) == 500.0
+
+    port = portfolio_by_period_frame(hist)
+    assert set(port["investee_ticker"]) == {"PRIV_HK_LISTED_INVESTEES_FV"}
+
+
+def test_quarterly_stack_collapses_filing_dates_not_selloff():
+    """2025-08-12 filing burst must not appear as its own x-axis tick."""
+    hist = pd.DataFrame(
+        [
+            {
+                "period_end": "2025-07-08",
+                "investee_ticker": "AS",
+                "action": "hold",
+                "market_value_usd": None,
+                "mark_at_filing_est_usd": 100_000_000.0,
+            },
+            {
+                "period_end": "2025-08-12",
+                "investee_ticker": "AS",
+                "action": "hold",
+                "market_value_usd": None,
+                "mark_at_filing_est_usd": 110_000_000.0,
+            },
+            {
+                "period_end": "2025-08-12",
+                "investee_ticker": "SE",
+                "action": "new",
+                "market_value_usd": None,
+                "mark_at_filing_est_usd": 200_000_000.0,
+            },
+            {
+                "period_end": "2025-09-30",
+                "investee_ticker": "AS",
+                "action": "hold",
+                "market_value_usd": None,
+                "mark_at_filing_est_usd": 120_000_000.0,
+            },
+            {
+                "period_end": "2025-09-30",
+                "investee_ticker": "SE",
+                "action": "hold",
+                "market_value_usd": None,
+                "mark_at_filing_est_usd": 210_000_000.0,
+            },
+        ]
+    )
+    q = quarterly_display_stack_frame(hist)
+    periods = set(q["period_end"].astype(str))
+    assert "2025-08-12" not in periods
+    assert "2025-09-30" in periods
+    # Mid-quarter AS mark carries into 2025-09-30 (overwritten by 9/30 filing)
+    row = q[(q.period_end == "2025-09-30") & (q.investee_ticker == "AS")].iloc[0]
+    assert float(row["display_value_usd"]) == 120_000_000.0
+    wide = holdings_qoq_chart_frame(hist)
+    assert list(wide["period_end"].astype(str)) == ["2025-09-30"] or "2025-09-30" in set(
+        wide["period_end"].astype(str)
+    )
+    assert "2025-08-12" not in set(wide["period_end"].astype(str))

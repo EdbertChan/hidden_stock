@@ -1,0 +1,57 @@
+# Curated sell-side PDFs with named strategic-investment / SOTP tables.
+# Ingested into TCEHY live/history via apply_broker_overlay (note stamps only —
+# no separate broker_sotp table). Note 22 aggregates remain portfolio SoT.
+#
+# SERIES RULE: when you add one report, backfill prior vintages from the *same*
+# broker×parent into the same series so stake % can be confirmed over time.
+
+series:
+  - id: cmbigm_tencent_strategic
+    parent_ticker: TCEHY
+    broker: CMBIGM
+    parser: cmbigm_strategic_investments
+    table_marker: "valuation of strategic investments"
+    citation_template: "CMBIGM; Bloomberg, company data; market close {as_of}"
+    enabled: true
+    reports:
+      # Meituan still elevated post 2022 distribution-in-specie (~3.6%).
+      - id: cmbigm_tencent_2023-03-21
+        as_of: "2023-03-21"
+        published: "2023-03-23"
+        url: "https://hk-official.cmbi.info/upload/fefe3efe-2b2d-45c8-8302-e40a97fb437c.pdf"
+        enabled: true
+      - id: cmbigm_tencent_2023-07-14
+        as_of: "2023-07-14"
+        published: "2023-07-18"
+        url: "https://hk-official.cmbi.info/upload/516e1200-ae84-4a06-a1d2-72c212870e6b.pdf"
+        enabled: true
+      - id: cmbigm_tencent_2024-07-12
+        as_of: "2024-07-12"
+        published: "2024-07-15"
+        url: "https://hk-official.cmbi.info/upload/833cbdd9-8473-4250-8c16-403bb390aa44.pdf"
+        enabled: true
+      - id: cmbigm_tencent_2025-03-18
+        as_of: "2025-03-18"
+        published: "2025-03-20"
+        url: "https://hk-official.cmbi.info/upload/ae28043c-93f8-484b-abef-42129ce3742f.pdf"
+        enabled: true
+      - id: cmbigm_tencent_2025-05-13
+        as_of: "2025-05-13"
+        published: "2025-05-15"
+        url: "https://hk-official.cmbi.info/upload/6e4aa41c-160f-4577-8c7f-7fd7f657b3c6.pdf"
+        enabled: true
+      - id: cmbigm_tencent_2025-08-12
+        as_of: "2025-08-12"
+        published: "2025-08-14"
+        url: "https://hk-official.cmbi.info/upload/c8b23fa6-41b3-452e-a588-c52efc895595.pdf"
+        enabled: true
+      - id: cmbigm_tencent_2026-03-19
+        as_of: "2026-03-19"
+        published: "2026-03-19"
+        url: "https://pdf.dfcfw.com/pdf/H3_AP202603191820638211_1.pdf"
+        enabled: true
+      - id: cmbigm_tencent_2026-05-12
+        as_of: "2026-05-12"
+        published: "2026-05-14"
+        url: "https://pdf.dfcfw.com/pdf/H3_AP202605141822301592_1.pdf"
+        enabled: true

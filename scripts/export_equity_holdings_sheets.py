@@ -53,8 +53,11 @@ def main() -> int:
     p.add_argument(
         "--lookback-years",
         type=int,
-        default=5,
-        help="Primary history depth: calendar years from today/as_of (default 5)",
+        default=None,
+        help=(
+            "Primary history depth: calendar years from today/as_of. "
+            "Default 8 for fanout_13g_hk (TCEHY), else 5"
+        ),
     )
     p.add_argument(
         "--max-filings",
@@ -84,6 +87,10 @@ def main() -> int:
 
     parent = normalize_parent(args.ticker)
     strategy = history_strategy(parent)
+    if args.lookback_years is None:
+        lookback_years = 8 if strategy == "fanout_13g_hk" else 5
+    else:
+        lookback_years = int(args.lookback_years)
 
     if args.reuse_sheet:
         create_new = False
@@ -97,7 +104,7 @@ def main() -> int:
         refresh=bool(args.live),
         history=bool(args.history),
         max_filings=int(args.max_filings),
-        lookback_years=int(args.lookback_years),
+        lookback_years=lookback_years,
         out_dir=args.out_dir,
         push_sheets=not args.no_sheets,
         spreadsheet_id=args.spreadsheet_id,

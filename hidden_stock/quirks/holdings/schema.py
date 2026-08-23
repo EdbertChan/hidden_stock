@@ -34,6 +34,11 @@ HOLDINGS_COLUMNS = [
     "source_quote",
     "confidence",
     "note",
+    # Best-guess cost basis from EOD×shares at first_seen (not GAAP / not portfolio SoT)
+    "cost_basis_est_usd",
+    "cost_basis_est_price",
+    "cost_basis_est_as_of",
+    "cost_basis_est_source",
 ]
 
 

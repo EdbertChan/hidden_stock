@@ -17,7 +17,9 @@ full_pipeline_job = dg.define_asset_job(
 equity_holdings_job = dg.define_asset_job(
     name="equity_holdings_job",
     selection=dg.AssetSelection.assets(
-        "equity_holdings", "equity_holdings_history", "equity_holdings_export"
+        "equity_holdings",
+        "equity_holdings_history",
+        "equity_holdings_export",
     ),
 )
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -20,14 +21,35 @@ from .schema import HOLDINGS_COLUMNS
 SHEET_POSITIONS = "positions_qoq"
 SHEET_CURRENT = "current_holdings"
 SHEET_PORTFOLIO = "portfolio_by_period"
-SHEET_CHART = "chart_data"
+SHEET_HOLDINGS_QOQ_CHART = "holdings_qoq_chart"
 SHEET_RETURNS = "returns_by_period"
 SHEET_REALIZED = "realized_pnl_qoq"
 SHEET_HOLDING_RETURNS = "holding_returns"
 SHEET_REPORTED_VS_EST = "reported_vs_est"
-SHEET_RETURNS_CHART = "returns_chart"
-SHEET_REALIZED_CHART = "realized_chart"
-SHEET_REALIZED_BY_TICKER = "realized_by_ticker_chart"
+# chart_data tab removed — named stack lives on holdings_qoq_chart (calendar quarters).
+# Thin returns_chart / realized_*_chart tabs removed — Dietz embeds on returns_by_period.
+# hk_composition tab removed — composition_* columns live on positions_qoq.
+
+# Sheets already scaled to $ millions (not raw USD).
+_SHEETS_IN_MILLIONS = frozenset(
+    {
+        SHEET_PORTFOLIO,
+        SHEET_HOLDINGS_QOQ_CHART,
+    }
+)
+
+# Raw USD ledger columns → display as $X.XXB (value unchanged).
+_USD_COL = re.compile(
+    r"(?:^|_)(market_value_usd|value_prev|value_delta|carrying_usd|"
+    r"fair_value_disclosed_usd|suggested_adj_usd|lookthrough_mtm_usd|"
+    r"realized_usd|realized_pnl|market_vs_carrying|"
+    r"cost_basis_est_usd|mark_at_filing_est_usd|parent_aggregate_market_value_usd)"
+    r"(?:$|_)",
+    re.I,
+)
+_SHARES_COL = re.compile(r"shares", re.I)
+_PCT_COL = re.compile(r"(ownership_pct|return_pct|dietz|_pct$|cagr|growth)", re.I)
+_MN_COL = re.compile(r"(_mn|_usd_mn|hkd_mn|mkt_cap)", re.I)
 
 # 13F values that blow up the stacked chart (likely unit/parse artifacts).
 CHART_EXCLUDE_TICKERS = frozenset({"MRDB"})
@@ -50,6 +72,15 @@ POSITIONS_COLS = [
     "filing_url",
     "first_seen_period",
     "exited_period",
+    "composition_parent",
+    "composition_as_of",
+    "child_value_source",
+    "parent_aggregate_market_value_usd",
+    "cost_basis_est_usd",
+    "cost_basis_est_price",
+    "cost_basis_est_as_of",
+    "cost_basis_est_source",
+    "mark_at_filing_est_usd",
     "note",
 ]
 
@@ -177,11 +208,21 @@ def portfolio_by_period_frame(hist: pd.DataFrame) -> pd.DataFrame:
     """Long format ready for stacked bar: period_end × investee_ticker × market_value_usd.
 
     Rows with missing market_value are dropped (missing ≠ $0).
+    HK composition residuals are excluded (mirror parent $ — no double-count).
     """
     if hist.empty:
         return pd.DataFrame(columns=["period_end", "investee_ticker", "market_value_usd"])
     df = hist.copy()
     df = df[df["action"].astype(str) != "exit"].copy()
+    try:
+        from .composition import excluded_from_portfolio_mv
+
+        mask = [
+            not excluded_from_portfolio_mv(r) for r in df.to_dict(orient="records")
+        ]
+        df = df.iloc[[i for i, ok in enumerate(mask) if ok]].copy()
+    except Exception:
+        pass
     df["investee_ticker"] = df["investee_ticker"].fillna("").astype(str).str.upper()
     blank = df["investee_ticker"] == ""
     if blank.any() and "investee_name" in df.columns:
@@ -190,6 +231,8 @@ def portfolio_by_period_frame(hist: pd.DataFrame) -> pd.DataFrame:
         )
     elif blank.any():
         df.loc[blank, "investee_ticker"] = "UNKNOWN"
+    # Drop residual tickers even if note filter missed.
+    df = df[~df["investee_ticker"].astype(str).str.endswith("_RESIDUAL")].copy()
     df["market_value_usd"] = pd.to_numeric(df["market_value_usd"], errors="coerce")
     df = df[df["market_value_usd"].notna()].copy()
     if df.empty:
@@ -203,29 +246,74 @@ def portfolio_by_period_frame(hist: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def chart_data_frame(
-    hist: pd.DataFrame,
+def display_stack_by_period_frame(hist: pd.DataFrame) -> pd.DataFrame:
+    """Named QoQ sizing for chart display — not portfolio / Dietz SoT.
+
+    Prefer disclosed/broker ``market_value_usd`` (even when excluded from portfolio),
+    else ``mark_at_filing_est_usd``. Skips ``PRIV_*``, residuals, exits. Never invents.
+    """
+    cols = ["period_end", "investee_ticker", "display_value_usd"]
+    if hist is None or hist.empty:
+        return pd.DataFrame(columns=cols)
+    df = hist.copy()
+    df = df[df["action"].astype(str).str.lower() != "exit"].copy()
+    df["investee_ticker"] = df["investee_ticker"].fillna("").astype(str).str.upper()
+    blank = df["investee_ticker"] == ""
+    if blank.any() and "investee_name" in df.columns:
+        df.loc[blank, "investee_ticker"] = (
+            df.loc[blank, "investee_name"].fillna("UNKNOWN").astype(str).str.upper()
+        )
+    elif blank.any():
+        df.loc[blank, "investee_ticker"] = "UNKNOWN"
+    t = df["investee_ticker"].astype(str)
+    df = df[
+        ~t.str.startswith("PRIV_")
+        & ~t.str.endswith("_RESIDUAL")
+        & (t != "")
+        & (t != "NAN")
+    ].copy()
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    mv = pd.to_numeric(df.get("market_value_usd"), errors="coerce")
+    mark = (
+        pd.to_numeric(df.get("mark_at_filing_est_usd"), errors="coerce")
+        if "mark_at_filing_est_usd" in df.columns
+        else pd.Series(float("nan"), index=df.index)
+    )
+    df["display_value_usd"] = mv.where(mv.notna(), mark)
+    df = df[df["display_value_usd"].notna()].copy()
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    out = (
+        df.groupby(["period_end", "investee_ticker"], as_index=False)["display_value_usd"]
+        .sum()
+        .sort_values(["period_end", "investee_ticker"], kind="mergesort")
+        .reset_index(drop=True)
+    )
+    return out
+
+
+def _wide_stack_chart(
+    long: pd.DataFrame,
     *,
+    value_col: str,
     top_n: int | None = None,
     exclude_tickers: frozenset[str] | None = None,
 ) -> pd.DataFrame:
-    """Wide chart matrix. One column per investee ticker — never an OTHER bucket.
-
-    Series ordered by **latest** period $ (not all-time max). ``top_n`` if set
-    keeps only the top-N latest names and **omits** the rest (no rollup column).
-    """
-    port = portfolio_by_period_frame(hist)
-    if port.empty:
+    """Pivot long period×ticker×$ to wide $M chart matrix sorted by latest size."""
+    if long is None or long.empty:
         return pd.DataFrame(columns=["period_end"])
+    port = long.copy()
     skip = exclude_tickers if exclude_tickers is not None else CHART_EXCLUDE_TICKERS
     port = port[~port["investee_ticker"].astype(str).str.upper().isin(skip)].copy()
-    if port.empty:
+    if port.empty or value_col not in port.columns:
         return pd.DataFrame(columns=["period_end"])
 
     latest = str(sorted(port["period_end"].astype(str).unique())[-1])
     latest_vals = (
         port[port["period_end"].astype(str) == latest]
-        .groupby("investee_ticker")["market_value_usd"]
+        .groupby("investee_ticker")[value_col]
         .sum()
         .sort_values(ascending=False)
     )
@@ -234,23 +322,18 @@ def chart_data_frame(
         port = port[port["investee_ticker"].isin(keep)].copy()
         latest_vals = latest_vals.head(int(top_n))
     series = list(latest_vals.index)
-    # Also include tickers that only appear in earlier periods (still real names)
     earlier = [
         t
         for t in port["investee_ticker"].astype(str).unique()
         if t and t.upper() != "NAN" and t not in series
     ]
     earlier.sort(
-        key=lambda t: -float(
-            port[port["investee_ticker"] == t]["market_value_usd"].max() or 0
-        )
+        key=lambda t: -float(port[port["investee_ticker"] == t][value_col].max() or 0)
     )
     series = series + earlier
-    agg = port.groupby(["period_end", "investee_ticker"], as_index=False)[
-        "market_value_usd"
-    ].sum()
+    agg = port.groupby(["period_end", "investee_ticker"], as_index=False)[value_col].sum()
     wide = (
-        agg.pivot(index="period_end", columns="investee_ticker", values="market_value_usd")
+        agg.pivot(index="period_end", columns="investee_ticker", values=value_col)
         .reindex(columns=series)
         .fillna(0.0)
         .reset_index()
@@ -259,6 +342,134 @@ def chart_data_frame(
     for c in series:
         wide[c] = (pd.to_numeric(wide[c], errors="coerce").fillna(0.0) / 1e6).round(2)
     return wide
+
+
+def quarterly_display_stack_frame(hist: pd.DataFrame) -> pd.DataFrame:
+    """Calendar quarter-end snapshots of named display `$` (not filing-event grain).
+
+    For each quarter-end (3/31, 6/30, 9/30, 12/31): last display value with
+    ``period_end ≤`` that quarter while the name is still open (no exit yet).
+    """
+    cols = ["period_end", "investee_ticker", "display_value_usd"]
+    disp = display_stack_by_period_frame(hist)
+    if disp is None or disp.empty:
+        return pd.DataFrame(columns=cols)
+
+    exit_by: dict[str, str] = {}
+    if hist is not None and not hist.empty and "action" in hist.columns:
+        ex = hist[hist["action"].astype(str).str.lower() == "exit"].copy()
+        if not ex.empty:
+            ex["investee_ticker"] = (
+                ex["investee_ticker"].fillna("").astype(str).str.upper()
+            )
+            for _, r in ex.iterrows():
+                t = str(r.get("investee_ticker") or "")
+                pe = str(r.get("exited_period") or r.get("period_end") or "")[:10]
+                if t and pe and (t not in exit_by or pe < exit_by[t]):
+                    exit_by[t] = pe
+
+    pe_min = str(disp["period_end"].astype(str).min())[:10]
+    pe_max = str(disp["period_end"].astype(str).max())[:10]
+    try:
+        q_ends = pd.date_range(start=pe_min, end=pe_max, freq="QE")
+    except ValueError:
+        q_ends = pd.date_range(start=pe_min, end=pe_max, freq="Q")
+    if len(q_ends) == 0:
+        # Single intra-quarter span — still emit pe_max as a point if needed.
+        q_ends = pd.DatetimeIndex([pd.Timestamp(pe_max)])
+
+    disp = disp.sort_values(["investee_ticker", "period_end"], kind="mergesort")
+    out_rows: list[dict] = []
+    tickers = sorted(disp["investee_ticker"].astype(str).unique())
+    for q in q_ends:
+        q_str = q.strftime("%Y-%m-%d")
+        for t in tickers:
+            if t in exit_by and exit_by[t] <= q_str:
+                continue
+            sub = disp[
+                (disp["investee_ticker"].astype(str) == t)
+                & (disp["period_end"].astype(str).str[:10] <= q_str)
+            ]
+            if sub.empty:
+                continue
+            val = float(sub.iloc[-1]["display_value_usd"])
+            out_rows.append(
+                {
+                    "period_end": q_str,
+                    "investee_ticker": t,
+                    "display_value_usd": val,
+                }
+            )
+    if not out_rows:
+        return pd.DataFrame(columns=cols)
+    return (
+        pd.DataFrame(out_rows)
+        .groupby(["period_end", "investee_ticker"], as_index=False)["display_value_usd"]
+        .sum()
+        .sort_values(["period_end", "investee_ticker"], kind="mergesort")
+        .reset_index(drop=True)
+    )
+
+
+def holdings_qoq_chart_frame(
+    hist: pd.DataFrame,
+    *,
+    top_n: int | None = None,
+    exclude_tickers: frozenset[str] | None = None,
+) -> pd.DataFrame:
+    """Wide $M matrix for ``holdings_qoq_chart`` — calendar quarters, named sizing."""
+    qlong = quarterly_display_stack_frame(hist)
+    if not qlong.empty:
+        wide = _wide_stack_chart(
+            qlong,
+            value_col="display_value_usd",
+            top_n=top_n,
+            exclude_tickers=exclude_tickers,
+        )
+        if not wide.empty:
+            wide.attrs["chart_basis"] = "display_estimate_or_broker"
+            return wide
+    # UBER-style fallback: quarter-resample portfolio SoT if no display marks.
+    port = portfolio_by_period_frame(hist)
+    if port.empty:
+        return pd.DataFrame(columns=["period_end"])
+    # Treat portfolio rows as display for quarterly resample via a synthetic hist.
+    synth = port.rename(columns={"market_value_usd": "mark_at_filing_est_usd"})
+    synth["action"] = "hold"
+    synth["market_value_usd"] = port["market_value_usd"]
+    q2 = quarterly_display_stack_frame(synth)
+    # quarterly_display_stack uses display_stack which prefers market_value — OK
+    if q2.empty:
+        wide = _wide_stack_chart(
+            port,
+            value_col="market_value_usd",
+            top_n=top_n,
+            exclude_tickers=exclude_tickers,
+        )
+        if not wide.empty:
+            wide.attrs["chart_basis"] = "portfolio_sot"
+        return wide
+    wide = _wide_stack_chart(
+        q2,
+        value_col="display_value_usd",
+        top_n=top_n,
+        exclude_tickers=exclude_tickers,
+    )
+    if not wide.empty:
+        wide.attrs["chart_basis"] = "portfolio_sot"
+    return wide
+
+
+def chart_data_frame(
+    hist: pd.DataFrame,
+    *,
+    top_n: int | None = None,
+    exclude_tickers: frozenset[str] | None = None,
+) -> pd.DataFrame:
+    """Deprecated alias — prefer ``holdings_qoq_chart_frame`` (calendar quarters)."""
+    return holdings_qoq_chart_frame(
+        hist, top_n=top_n, exclude_tickers=exclude_tickers
+    )
 
 
 def write_csvs(
@@ -270,7 +481,11 @@ def write_csvs(
     lookback_start: str | None = None,
 ) -> dict[str, Path]:
     from .history import assert_unique_period_ticker
-    from .validate import assert_live_shares_held_sane, scrub_live_pct_as_shares
+    from .validate import (
+        assert_estimates_not_in_market_value,
+        assert_live_shares_held_sane,
+        scrub_live_pct_as_shares,
+    )
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -284,13 +499,20 @@ def write_csvs(
         hist = pd.DataFrame(coalesce_period_ticker(hist.to_dict(orient="records")))
         if "investee_ticker" in hist.columns:
             hist["investee_ticker"] = hist["investee_ticker"].map(normalize_ticker)
+        hist_recs = hist.to_dict(orient="records")
         assert_unique_period_ticker(
-            hist.to_dict(orient="records"),
+            hist_recs,
             context=f"export/{parent}",
+        )
+        assert_estimates_not_in_market_value(
+            hist_recs, context=f"export/{parent}/history"
         )
     if hold is not None and len(hold):
         cleaned = scrub_live_pct_as_shares(hold.to_dict(orient="records"))
         assert_live_shares_held_sane(cleaned, context=f"export/{parent}/current")
+        assert_estimates_not_in_market_value(
+            cleaned, context=f"export/{parent}/current"
+        )
         hold = pd.DataFrame(cleaned)
     slug = parent.lower().replace("-", "")
 
@@ -304,6 +526,7 @@ def write_csvs(
     positions = positions_qoq_frame(hist)
     # Chart + portfolio stay on the display window.
     portfolio = portfolio_by_period_frame(_window(hist))
+    qoq_chart = holdings_qoq_chart_frame(_window(hist))
     from .performance import performance_frames
 
     # Lots/Dietz use full (inception-extended) history; display tabs window-filtered.
@@ -312,44 +535,24 @@ def write_csvs(
         parent=parent,
     )
     returns_by_period = _window(perf["returns_by_period"])
-    returns_chart = _window(perf["returns_chart"])
-    from .performance import realized_by_ticker_chart_frame, realized_chart_frame
-
-    realized_chart = realized_chart_frame(returns_by_period)
-    realized_events = perf["realized_pnl_qoq"]
-    if (
-        lookback_start
-        and realized_events is not None
-        and not realized_events.empty
-        and "period_end" in realized_events.columns
-    ):
-        pe = realized_events["period_end"].astype(str).str[:10]
-        realized_events_win = realized_events[pe >= str(lookback_start)[:10]].copy()
-    else:
-        realized_events_win = realized_events
-    realized_by_ticker = realized_by_ticker_chart_frame(realized_events_win)
     paths = {
         "current": out / f"{slug}_equity_holdings.csv",
         "history": out / f"{slug}_equity_holdings_history.csv",
         "portfolio": out / f"{slug}_portfolio_by_period.csv",
+        "holdings_qoq_chart": out / f"{slug}_holdings_qoq_chart.csv",
         "returns_by_period": out / f"{slug}_returns_by_period.csv",
         "realized_pnl_qoq": out / f"{slug}_realized_pnl_qoq.csv",
         "holding_returns": out / f"{slug}_holding_returns.csv",
         "reported_vs_est": out / f"{slug}_reported_vs_est.csv",
-        "returns_chart": out / f"{slug}_returns_chart.csv",
-        "realized_chart": out / f"{slug}_realized_chart.csv",
-        "realized_by_ticker_chart": out / f"{slug}_realized_by_ticker_chart.csv",
     }
     hold.to_csv(paths["current"], index=False)
     positions.to_csv(paths["history"], index=False)
     portfolio.to_csv(paths["portfolio"], index=False)
+    qoq_chart.to_csv(paths["holdings_qoq_chart"], index=False)
     returns_by_period.to_csv(paths["returns_by_period"], index=False)
     perf["realized_pnl_qoq"].to_csv(paths["realized_pnl_qoq"], index=False)
     perf["holding_returns"].to_csv(paths["holding_returns"], index=False)
     perf["reported_vs_est"].to_csv(paths["reported_vs_est"], index=False)
-    returns_chart.to_csv(paths["returns_chart"], index=False)
-    realized_chart.to_csv(paths["realized_chart"], index=False)
-    realized_by_ticker.to_csv(paths["realized_by_ticker_chart"], index=False)
     return paths
 
 
@@ -428,8 +631,99 @@ def _df_to_rows(df: pd.DataFrame) -> list[list[Any]]:
         return [[]]
     clean = df.where(pd.notnull(df), "")
     header = [str(c) for c in clean.columns]
-    body = clean.astype(object).values.tolist()
+    body: list[list[Any]] = []
+    for _, series in clean.iterrows():
+        row: list[Any] = []
+        for v in series.tolist():
+            if v == "" or v is None:
+                row.append("")
+            elif isinstance(v, bool):
+                row.append(v)
+            elif isinstance(v, (int, float)):
+                if isinstance(v, float) and (pd.isna(v) or abs(v) == float("inf")):
+                    row.append("")
+                else:
+                    row.append(v)
+            else:
+                # numpy scalars
+                try:
+                    if pd.isna(v):
+                        row.append("")
+                        continue
+                except (TypeError, ValueError):
+                    pass
+                if hasattr(v, "item"):
+                    try:
+                        row.append(v.item())
+                        continue
+                    except Exception:
+                        pass
+                row.append(v)
+        body.append(row)
     return [header, *body]
+
+
+def _number_format_for_column(col: str, *, sheet: str) -> str | None:
+    """Google Sheets numberFormat pattern for a column (display only)."""
+    c = str(col)
+    if sheet in _SHEETS_IN_MILLIONS:
+        if c in {"period_end", "investee_ticker", "investee_name"}:
+            return None
+        return '$#,##0.0"M"'
+    if _PCT_COL.search(c) or c.startswith("stake_pct_"):
+        return '0.00"%"'
+    if _USD_COL.search(c):
+        # 136595348061 → $136.60B (underlying value unchanged)
+        return '$#,##0.00,,,"B"'
+    if _SHARES_COL.search(c):
+        return "#,##0"
+    if _MN_COL.search(c):
+        return "#,##0.0"
+    if sheet == SHEET_RETURNS and c in {"dietz_return_pct", "cum_dietz_growth"}:
+        return "0.00"
+    return None
+
+
+def _apply_worksheet_number_formats(ws, df: pd.DataFrame, *, sheet: str) -> None:
+    if df is None or df.empty:
+        return
+    reqs: list[dict] = []
+    nrows = len(df) + 1
+    for i, col in enumerate(df.columns):
+        pattern = _number_format_for_column(str(col), sheet=sheet)
+        if not pattern:
+            continue
+        reqs.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": 1,
+                        "endRowIndex": nrows,
+                        "startColumnIndex": i,
+                        "endColumnIndex": i + 1,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {"type": "NUMBER", "pattern": pattern}
+                        }
+                    },
+                    "fields": "userEnteredFormat.numberFormat",
+                }
+            }
+        )
+    reqs.append(
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": ws.id,
+                    "gridProperties": {"frozenRowCount": 1},
+                },
+                "fields": "gridProperties.frozenRowCount",
+            }
+        }
+    )
+    ws.spreadsheet.batch_update({"requests": reqs})
 
 
 def _replace_worksheet(sh, title: str, df: pd.DataFrame) -> None:
@@ -444,6 +738,10 @@ def _replace_worksheet(sh, title: str, df: pd.DataFrame) -> None:
     ws = sh.add_worksheet(title=title, rows=nrows + 10, cols=ncols + 2)
     if rows and rows[0]:
         ws.update(rows, value_input_option="USER_ENTERED")
+        try:
+            _apply_worksheet_number_formats(ws, df, sheet=title)
+        except Exception:
+            pass
 
 
 def _gspread_credentials(gc):
@@ -457,8 +755,15 @@ def _gspread_credentials(gc):
     raise RuntimeError("could not read credentials from gspread client")
 
 
-def _upsert_qoq_stacked_chart(spreadsheet_id: str, gc, chart_df: pd.DataFrame) -> None:
-    """Replace chart_data charts with a stacked column chart of holdings over time."""
+def _upsert_qoq_stacked_chart(
+    spreadsheet_id: str,
+    gc,
+    chart_df: pd.DataFrame,
+    *,
+    chart_basis: str | None = None,
+    sheet_title: str = SHEET_HOLDINGS_QOQ_CHART,
+) -> None:
+    """Stacked column chart on ``holdings_qoq_chart`` (calendar quarters)."""
     if chart_df.empty or len(chart_df.columns) < 2:
         return
     from googleapiclient.discovery import build
@@ -470,7 +775,7 @@ def _upsert_qoq_stacked_chart(spreadsheet_id: str, gc, chart_df: pd.DataFrame) -
     delete_reqs: list[dict] = []
     for s in meta.get("sheets", []):
         props = s.get("properties") or {}
-        if props.get("title") == SHEET_CHART:
+        if props.get("title") == sheet_title:
             sheet_id = props.get("sheetId")
             for ch in s.get("charts") or []:
                 delete_reqs.append({"deleteEmbeddedObject": {"objectId": ch["chartId"]}})
@@ -499,45 +804,60 @@ def _upsert_qoq_stacked_chart(spreadsheet_id: str, gc, chart_df: pd.DataFrame) -
         }
         for i in range(1, ncols)
     ]
+    basis = chart_basis or getattr(chart_df, "attrs", {}).get("chart_basis")
+    if basis == "display_estimate_or_broker":
+        title = "Named holdings by calendar quarter ($M)"
+        subtitle = (
+            "basis=display_estimate_or_broker; not_portfolio_sot; "
+            "calendar QoQ (not 13G filing dates)"
+        )
+    else:
+        title = "Holdings market value by calendar quarter ($M)"
+        subtitle = "calendar QoQ"
+    spec: dict[str, Any] = {
+        "title": title,
+        "subtitle": subtitle,
+        "basicChart": {
+            "chartType": "COLUMN",
+            "legendPosition": "RIGHT_LEGEND",
+            "stackedType": "STACKED",
+            "headerCount": 1,
+            "domains": [
+                {
+                    "domain": {
+                        "sourceRange": {
+                            "sources": [
+                                {
+                                    "sheetId": sheet_id,
+                                    "startRowIndex": 0,
+                                    "endRowIndex": nrows,
+                                    "startColumnIndex": 0,
+                                    "endColumnIndex": 1,
+                                }
+                            ]
+                        }
+                    }
+                }
+            ],
+            "series": series,
+        },
+    }
+    # Own tab: pin chart at top-left with a small offset so headers stay readable.
     add_req = {
         "addChart": {
             "chart": {
-                "spec": {
-                    "title": "Holdings market value by quarter ($M)",
-                    "basicChart": {
-                        "chartType": "COLUMN",
-                        "legendPosition": "RIGHT_LEGEND",
-                        "stackedType": "STACKED",
-                        "headerCount": 1,
-                        "domains": [
-                            {
-                                "domain": {
-                                    "sourceRange": {
-                                        "sources": [
-                                            {
-                                                "sheetId": sheet_id,
-                                                "startRowIndex": 0,
-                                                "endRowIndex": nrows,
-                                                "startColumnIndex": 0,
-                                                "endColumnIndex": 1,
-                                            }
-                                        ]
-                                    }
-                                }
-                            }
-                        ],
-                        "series": series,
-                    },
-                },
+                "spec": spec,
                 "position": {
                     "overlayPosition": {
                         "anchorCell": {
                             "sheetId": sheet_id,
                             "rowIndex": 0,
-                            "columnIndex": ncols + 1,
+                            "columnIndex": 0,
                         },
-                        "widthPixels": 900,
-                        "heightPixels": 480,
+                        "offsetXPixels": 0,
+                        "offsetYPixels": 40,
+                        "widthPixels": 1200,
+                        "heightPixels": 560,
                     }
                 },
             }
@@ -548,23 +868,61 @@ def _upsert_qoq_stacked_chart(spreadsheet_id: str, gc, chart_df: pd.DataFrame) -
     ).execute()
 
 
+def _returns_sheet_frame(returns_by_period: pd.DataFrame) -> pd.DataFrame:
+    """returns_by_period plus dietz_return_pct for the Dietz combo chart."""
+    if returns_by_period is None or returns_by_period.empty:
+        return returns_by_period if returns_by_period is not None else pd.DataFrame()
+    out = returns_by_period.copy()
+    if "dietz_return" in out.columns and "dietz_return_pct" not in out.columns:
+        out["dietz_return_pct"] = (
+            pd.to_numeric(out["dietz_return"], errors="coerce") * 100.0
+        )
+        cols = list(out.columns)
+        cols.remove("dietz_return_pct")
+        i = cols.index("dietz_return") + 1
+        cols.insert(i, "dietz_return_pct")
+        out = out[cols]
+    return out
+
+
 def _upsert_returns_combo_chart(
     spreadsheet_id: str,
     gc,
-    returns_chart_df: pd.DataFrame,
+    returns_df: pd.DataFrame,
     *,
     cagr: float | None = None,
     years: float | None = None,
 ) -> None:
-    """Combo chart: QoQ Dietz % (columns) + cum growth index (line)."""
+    """Combo chart on returns_by_period: Dietz % (columns) + cum growth (line)."""
     from .performance import linked_dietz_cagr
 
-    # Data rows only (exclude blank/CAGR footer) for series ranges
-    data = returns_chart_df[
-        returns_chart_df["period_end"].astype(str).str.match(r"^\d{4}-\d{2}-\d{2}", na=False)
-    ].copy()
-    if data.empty or len(data.columns) < 3:
+    if returns_df is None or returns_df.empty or "period_end" not in returns_df.columns:
         return
+    data = returns_df[
+        returns_df["period_end"].astype(str).str.match(r"^\d{4}-\d{2}-\d{2}", na=False)
+    ].copy()
+    if data.empty:
+        return
+    cols = [str(c) for c in data.columns]
+    pct_col = "dietz_return_pct" if "dietz_return_pct" in cols else None
+    if pct_col is None and "dietz_return" in cols:
+        data["dietz_return_pct"] = (
+            pd.to_numeric(data["dietz_return"], errors="coerce") * 100.0
+        )
+        pct_col = "dietz_return_pct"
+        cols = [str(c) for c in data.columns]
+    growth_col = (
+        "cum_dietz_growth"
+        if "cum_dietz_growth" in cols
+        else ("cum_growth_index" if "cum_growth_index" in cols else None)
+    )
+    if pct_col is None or growth_col is None:
+        return
+
+    domain_i = cols.index("period_end")
+    pct_i = cols.index(pct_col)
+    growth_i = cols.index(growth_col)
+
     from googleapiclient.discovery import build
 
     creds = _gspread_credentials(gc)
@@ -574,7 +932,7 @@ def _upsert_returns_combo_chart(
     delete_reqs: list[dict] = []
     for s in meta.get("sheets", []):
         props = s.get("properties") or {}
-        if props.get("title") == SHEET_RETURNS_CHART:
+        if props.get("title") == SHEET_RETURNS:
             sheet_id = props.get("sheetId")
             for ch in s.get("charts") or []:
                 delete_reqs.append({"deleteEmbeddedObject": {"objectId": ch["chartId"]}})
@@ -582,17 +940,16 @@ def _upsert_returns_combo_chart(
     if sheet_id is None:
         return
 
-    # Header + data rows only (footer starts after blank)
-    nrows = len(data) + 1  # includes header row index 0
+    nrows = len(data) + 1
     if cagr is None:
         info = linked_dietz_cagr(
             pd.DataFrame(
                 {
                     "period_end": data["period_end"],
-                    "dietz_return": data["dietz_return_pct"].apply(
+                    "dietz_return": data[pct_col].apply(
                         lambda x: float(x) / 100.0 if x is not None and x == x else None
                     ),
-                    "cum_dietz_growth": data["cum_growth_index"],
+                    "cum_dietz_growth": data[growth_col],
                 }
             )
         )
@@ -604,6 +961,25 @@ def _upsert_returns_combo_chart(
         )
     else:
         subtitle = "CAGR n/a (linked Dietz; estimated)"
+
+    def _col_series(col_index: int, series_type: str, axis: str) -> dict:
+        return {
+            "series": {
+                "sourceRange": {
+                    "sources": [
+                        {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 0,
+                            "endRowIndex": nrows,
+                            "startColumnIndex": col_index,
+                            "endColumnIndex": col_index + 1,
+                        }
+                    ]
+                }
+            },
+            "targetAxis": axis,
+            "type": series_type,
+        }
 
     add_req = {
         "addChart": {
@@ -624,8 +1000,8 @@ def _upsert_returns_combo_chart(
                                                 "sheetId": sheet_id,
                                                 "startRowIndex": 0,
                                                 "endRowIndex": nrows,
-                                                "startColumnIndex": 0,
-                                                "endColumnIndex": 1,
+                                                "startColumnIndex": domain_i,
+                                                "endColumnIndex": domain_i + 1,
                                             }
                                         ]
                                     }
@@ -633,40 +1009,8 @@ def _upsert_returns_combo_chart(
                             }
                         ],
                         "series": [
-                            {
-                                "series": {
-                                    "sourceRange": {
-                                        "sources": [
-                                            {
-                                                "sheetId": sheet_id,
-                                                "startRowIndex": 0,
-                                                "endRowIndex": nrows,
-                                                "startColumnIndex": 1,
-                                                "endColumnIndex": 2,
-                                            }
-                                        ]
-                                    }
-                                },
-                                "targetAxis": "LEFT_AXIS",
-                                "type": "COLUMN",
-                            },
-                            {
-                                "series": {
-                                    "sourceRange": {
-                                        "sources": [
-                                            {
-                                                "sheetId": sheet_id,
-                                                "startRowIndex": 0,
-                                                "endRowIndex": nrows,
-                                                "startColumnIndex": 2,
-                                                "endColumnIndex": 3,
-                                            }
-                                        ]
-                                    }
-                                },
-                                "targetAxis": "RIGHT_AXIS",
-                                "type": "LINE",
-                            },
+                            _col_series(pct_i, "COLUMN", "LEFT_AXIS"),
+                            _col_series(growth_i, "LINE", "RIGHT_AXIS"),
                         ],
                     },
                 },
@@ -675,213 +1019,7 @@ def _upsert_returns_combo_chart(
                         "anchorCell": {
                             "sheetId": sheet_id,
                             "rowIndex": 0,
-                            "columnIndex": 4,
-                        },
-                        "widthPixels": 900,
-                        "heightPixels": 480,
-                    }
-                },
-            }
-        }
-    }
-    svc.spreadsheets().batchUpdate(
-        spreadsheetId=spreadsheet_id, body={"requests": [*delete_reqs, add_req]}
-    ).execute()
-
-
-def _upsert_realized_combo_chart(
-    spreadsheet_id: str,
-    gc,
-    realized_chart_df: pd.DataFrame,
-) -> None:
-    """Combo chart: QoQ avg-cost realized ($M) columns + cum realized ($M) line."""
-    data = realized_chart_df[
-        realized_chart_df["period_end"].astype(str).str.match(r"^\d{4}-\d{2}-\d{2}", na=False)
-    ].copy()
-    if data.empty or len(data.columns) < 3:
-        return
-    from googleapiclient.discovery import build
-
-    creds = _gspread_credentials(gc)
-    svc = build("sheets", "v4", credentials=creds)
-    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    sheet_id = None
-    delete_reqs: list[dict] = []
-    for s in meta.get("sheets", []):
-        props = s.get("properties") or {}
-        if props.get("title") == SHEET_REALIZED_CHART:
-            sheet_id = props.get("sheetId")
-            for ch in s.get("charts") or []:
-                delete_reqs.append({"deleteEmbeddedObject": {"objectId": ch["chartId"]}})
-            break
-    if sheet_id is None:
-        return
-
-    nrows = len(data) + 1
-    add_req = {
-        "addChart": {
-            "chart": {
-                "spec": {
-                    "title": "Estimated avg-cost realized P&L ($M)",
-                    "subtitle": "QoQ disposal estimate + cumulative; not tax/GAAP",
-                    "basicChart": {
-                        "chartType": "COMBO",
-                        "legendPosition": "BOTTOM_LEGEND",
-                        "headerCount": 1,
-                        "domains": [
-                            {
-                                "domain": {
-                                    "sourceRange": {
-                                        "sources": [
-                                            {
-                                                "sheetId": sheet_id,
-                                                "startRowIndex": 0,
-                                                "endRowIndex": nrows,
-                                                "startColumnIndex": 0,
-                                                "endColumnIndex": 1,
-                                            }
-                                        ]
-                                    }
-                                }
-                            }
-                        ],
-                        "series": [
-                            {
-                                "series": {
-                                    "sourceRange": {
-                                        "sources": [
-                                            {
-                                                "sheetId": sheet_id,
-                                                "startRowIndex": 0,
-                                                "endRowIndex": nrows,
-                                                "startColumnIndex": 1,
-                                                "endColumnIndex": 2,
-                                            }
-                                        ]
-                                    }
-                                },
-                                "targetAxis": "LEFT_AXIS",
-                                "type": "COLUMN",
-                            },
-                            {
-                                "series": {
-                                    "sourceRange": {
-                                        "sources": [
-                                            {
-                                                "sheetId": sheet_id,
-                                                "startRowIndex": 0,
-                                                "endRowIndex": nrows,
-                                                "startColumnIndex": 2,
-                                                "endColumnIndex": 3,
-                                            }
-                                        ]
-                                    }
-                                },
-                                "targetAxis": "RIGHT_AXIS",
-                                "type": "LINE",
-                            },
-                        ],
-                    },
-                },
-                "position": {
-                    "overlayPosition": {
-                        "anchorCell": {
-                            "sheetId": sheet_id,
-                            "rowIndex": 0,
-                            "columnIndex": 4,
-                        },
-                        "widthPixels": 900,
-                        "heightPixels": 480,
-                    }
-                },
-            }
-        }
-    }
-    svc.spreadsheets().batchUpdate(
-        spreadsheetId=spreadsheet_id, body={"requests": [*delete_reqs, add_req]}
-    ).execute()
-
-
-def _upsert_realized_by_ticker_chart(
-    spreadsheet_id: str,
-    gc,
-    by_ticker_df: pd.DataFrame,
-) -> None:
-    """Column chart: investee ticker vs total estimated avg-cost realized ($M)."""
-    data = by_ticker_df.copy() if by_ticker_df is not None else pd.DataFrame()
-    if data.empty or len(data.columns) < 2:
-        return
-    from googleapiclient.discovery import build
-
-    creds = _gspread_credentials(gc)
-    svc = build("sheets", "v4", credentials=creds)
-    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    sheet_id = None
-    delete_reqs: list[dict] = []
-    for s in meta.get("sheets", []):
-        props = s.get("properties") or {}
-        if props.get("title") == SHEET_REALIZED_BY_TICKER:
-            sheet_id = props.get("sheetId")
-            for ch in s.get("charts") or []:
-                delete_reqs.append({"deleteEmbeddedObject": {"objectId": ch["chartId"]}})
-            break
-    if sheet_id is None:
-        return
-
-    nrows = len(data) + 1
-    add_req = {
-        "addChart": {
-            "chart": {
-                "spec": {
-                    "title": "Estimated realized P&L by ticker ($M)",
-                    "subtitle": "Avg-cost disposal sum in window; not tax/GAAP",
-                    "basicChart": {
-                        "chartType": "COLUMN",
-                        "legendPosition": "BOTTOM_LEGEND",
-                        "headerCount": 1,
-                        "domains": [
-                            {
-                                "domain": {
-                                    "sourceRange": {
-                                        "sources": [
-                                            {
-                                                "sheetId": sheet_id,
-                                                "startRowIndex": 0,
-                                                "endRowIndex": nrows,
-                                                "startColumnIndex": 0,
-                                                "endColumnIndex": 1,
-                                            }
-                                        ]
-                                    }
-                                }
-                            }
-                        ],
-                        "series": [
-                            {
-                                "series": {
-                                    "sourceRange": {
-                                        "sources": [
-                                            {
-                                                "sheetId": sheet_id,
-                                                "startRowIndex": 0,
-                                                "endRowIndex": nrows,
-                                                "startColumnIndex": 1,
-                                                "endColumnIndex": 2,
-                                            }
-                                        ]
-                                    }
-                                },
-                                "targetAxis": "LEFT_AXIS",
-                            }
-                        ],
-                    },
-                },
-                "position": {
-                    "overlayPosition": {
-                        "anchorCell": {
-                            "sheetId": sheet_id,
-                            "rowIndex": 0,
-                            "columnIndex": 3,
+                            "columnIndex": max(len(cols), 4),
                         },
                         "widthPixels": 900,
                         "heightPixels": 480,
@@ -967,47 +1105,44 @@ def push_google_sheets(
 
     windowed = _window(hist)
     portfolio = portfolio_by_period_frame(windowed)
-    chart = chart_data_frame(windowed)
-    from .performance import (
-        linked_dietz_cagr,
-        performance_frames,
-        realized_by_ticker_chart_frame,
-        realized_chart_frame,
-    )
+    qoq_chart = holdings_qoq_chart_frame(windowed)
+    from .performance import linked_dietz_cagr, performance_frames
 
     perf = performance_frames(hist, parent=parent)
-    returns_chart = _window(perf["returns_chart"])
-    returns_by_period = _window(perf["returns_by_period"])
-    realized_chart = realized_chart_frame(returns_by_period)
-    realized_events = perf["realized_pnl_qoq"]
-    if (
-        lookback_start
-        and realized_events is not None
-        and not realized_events.empty
-        and "period_end" in realized_events.columns
-    ):
-        pe = realized_events["period_end"].astype(str).str[:10]
-        realized_events_win = realized_events[pe >= str(lookback_start)[:10]].copy()
-    else:
-        realized_events_win = realized_events
-    realized_by_ticker = realized_by_ticker_chart_frame(realized_events_win)
+    returns_by_period = _returns_sheet_frame(_window(perf["returns_by_period"]))
     _replace_worksheet(sh, SHEET_POSITIONS, positions)
     _replace_worksheet(sh, SHEET_CURRENT, hold)
     _replace_worksheet(sh, SHEET_PORTFOLIO, portfolio)
-    _replace_worksheet(sh, SHEET_CHART, chart)
+    _replace_worksheet(sh, SHEET_HOLDINGS_QOQ_CHART, qoq_chart)
     _replace_worksheet(sh, SHEET_RETURNS, returns_by_period)
     _replace_worksheet(sh, SHEET_REALIZED, perf["realized_pnl_qoq"])
     _replace_worksheet(sh, SHEET_HOLDING_RETURNS, perf["holding_returns"])
     _replace_worksheet(sh, SHEET_REPORTED_VS_EST, perf["reported_vs_est"])
-    _replace_worksheet(sh, SHEET_RETURNS_CHART, returns_chart)
-    _replace_worksheet(sh, SHEET_REALIZED_CHART, realized_chart)
-    _replace_worksheet(sh, SHEET_REALIZED_BY_TICKER, realized_by_ticker)
+
+    # Drop legacy thin chart / composition tabs if present.
+    for legacy_title in (
+        "hk_composition",
+        "chart_data",
+        "returns_chart",
+        "realized_chart",
+        "realized_by_ticker_chart",
+    ):
+        try:
+            legacy = sh.worksheet(legacy_title)
+            sh.del_worksheet(legacy)
+        except Exception:
+            pass
+
     chart_ok = "true"
     returns_chart_ok = "true"
-    realized_chart_ok = "true"
-    realized_by_ticker_ok = "true"
     try:
-        _upsert_qoq_stacked_chart(sid, gc, chart)
+        _upsert_qoq_stacked_chart(
+            sid,
+            gc,
+            qoq_chart,
+            chart_basis=getattr(qoq_chart, "attrs", {}).get("chart_basis"),
+            sheet_title=SHEET_HOLDINGS_QOQ_CHART,
+        )
     except Exception as e:
         chart_ok = f"false:{e}"
     try:
@@ -1015,20 +1150,12 @@ def push_google_sheets(
         _upsert_returns_combo_chart(
             sid,
             gc,
-            returns_chart,
+            returns_by_period,
             cagr=cagr_info.get("cagr"),
             years=cagr_info.get("years"),
         )
     except Exception as e:
         returns_chart_ok = f"false:{e}"
-    try:
-        _upsert_realized_combo_chart(sid, gc, realized_chart)
-    except Exception as e:
-        realized_chart_ok = f"false:{e}"
-    try:
-        _upsert_realized_by_ticker_chart(sid, gc, realized_by_ticker)
-    except Exception as e:
-        realized_by_ticker_ok = f"false:{e}"
 
     if created:
         try:
@@ -1048,8 +1175,6 @@ def push_google_sheets(
         "title": sh.title if hasattr(sh, "title") else title,
         "chart": chart_ok,
         "returns_chart": returns_chart_ok,
-        "realized_chart": realized_chart_ok,
-        "realized_by_ticker_chart": realized_by_ticker_ok,
     }
 
 
@@ -1074,21 +1199,86 @@ def export_parent(
             from hidden_stock.resources.edgar_resource import EdgarResource
 
             edgar = EdgarResource(user_agent=os.environ["SEC_EDGAR_USER_AGENT"])
-    hold = refresh_current(parent, edgar, engine=eng) if refresh else load_current(parent, eng)
     from .lookback import lookback_start_date
 
     lookback_start = lookback_start_date(lookback_years=lookback_years)
-    hist = (
-        refresh_history(
+    if history:
+        hist = refresh_history(
             parent,
             edgar,
             max_filings=max_filings,
             lookback_years=lookback_years,
             engine=eng,
         )
-        if history
-        else load_history(parent, eng)
-    )
+        from .composition import live_holdings_from_history
+        from .rollup import rollup_holdings
+
+        hold = pd.DataFrame(
+            live_holdings_from_history(hist.to_dict(orient="records"))
+        )
+        # Persist live slice alongside history (single SoT).
+        try:
+            existing = pd.read_sql("SELECT * FROM stock_data.equity_holdings", eng)
+            existing = existing[
+                existing["parent_ticker"].astype(str).str.upper() != parent
+            ]
+            hold_out = (
+                pd.concat([existing, hold], ignore_index=True) if len(existing) else hold
+            )
+            hold_out.to_sql(
+                "equity_holdings", eng, schema="stock_data", if_exists="replace", index=False
+            )
+            roll = rollup_holdings(hold.to_dict(orient="records"))
+            as_of = None
+            if "as_of_date" in hold.columns and len(hold):
+                as_of = hold["as_of_date"].astype(str).max()
+            roll_df = pd.DataFrame(
+                [
+                    {
+                        **roll,
+                        "ticker": parent,
+                        "as_of_date": as_of,
+                        "accession_no": None,
+                        "extract_error": None,
+                    }
+                ]
+            )
+            try:
+                existing_r = pd.read_sql(
+                    "SELECT * FROM stock_data.equity_holdings_parent_rollups", eng
+                )
+                existing_r = existing_r[
+                    existing_r["ticker"].astype(str).str.upper() != parent
+                ]
+                roll_out = (
+                    pd.concat([existing_r, roll_df], ignore_index=True)
+                    if len(existing_r)
+                    else roll_df
+                )
+            except Exception:
+                roll_out = roll_df
+            roll_out.to_sql(
+                "equity_holdings_parent_rollups",
+                eng,
+                schema="stock_data",
+                if_exists="replace",
+                index=False,
+            )
+        except Exception:
+            pass
+    else:
+        hold = (
+            refresh_current(parent, edgar, engine=eng)
+            if refresh
+            else load_current(parent, eng)
+        )
+        hist = load_history(parent, eng)
+        if hist is not None and not hist.empty:
+            from .composition import live_holdings_from_history
+
+            hold = pd.DataFrame(
+                live_holdings_from_history(hist.to_dict(orient="records"))
+            )
     paths = write_csvs(parent, hold, hist, out_dir, lookback_start=lookback_start)
     result: dict[str, Any] = {
         "parent": parent,

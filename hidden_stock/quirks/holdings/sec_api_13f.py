@@ -11,7 +11,7 @@ import diskcache
 import requests
 
 from .extract import load_investee_aliases, resolve_investee_ticker
-from .parse_13f import load_cusip_tickers
+from .identity import load_cusip_tickers
 
 _SEC_13F_URL = "https://api.sec-api.io/form-13f/holdings"
 _CACHE = diskcache.Cache(os.path.expanduser("~/.cache/hidden_stock/sec_api_13f_filer"))
