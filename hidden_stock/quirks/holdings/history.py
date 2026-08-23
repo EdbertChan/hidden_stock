@@ -635,6 +635,7 @@ def _record_value_provenance(dst: dict, src: dict) -> None:
 
 
 def _fill_missing(dst: dict, src: dict) -> None:
+    had_ownership_pct = dst.get("ownership_pct") is not None
     for k, v in src.items():
         if v is None or k in {"_source", "note"}:
             continue
@@ -647,6 +648,18 @@ def _fill_missing(dst: dict, src: dict) -> None:
         filled_mv = True
     if dst.get("ownership_pct") is None and src.get("ownership_pct") is not None:
         dst["ownership_pct"] = src["ownership_pct"]
+    if (
+        not had_ownership_pct
+        and src.get("ownership_pct") is not None
+        and dst.get("ownership_pct") == src.get("ownership_pct")
+    ):
+        # ownership_pct came from a non-primary source (13G) merged onto a
+        # 13F-primary row — the note must not pretend it came from 13F alone
+        # (P5: provenance stamps travel with the value).
+        src_note = str(src.get("note") or "")
+        note = str(dst.get("note") or "")
+        if src_note and src_note not in note:
+            dst["note"] = f"{note}; {src_note}".strip("; ") if note else src_note
     if filled_mv or (
         src.get("market_value_usd") is not None
         and dst.get("market_value_usd") == src.get("market_value_usd")
