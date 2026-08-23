@@ -208,7 +208,7 @@ def test_display_stack_uses_mark_est_skips_priv_aggregates():
     assert "PDD" in wide.columns
     assert "PRIV_HK_LISTED_INVESTEES_FV" not in wide.columns
     assert wide.attrs.get("chart_basis") == "display_estimate_or_broker"
-    assert wide.attrs.get("chart_top_n") == 7
+    assert wide.attrs.get("chart_top_n") is None
     # Filing dates collapse to calendar quarters
     assert "2024-02-09" not in set(wide["period_end"].astype(str))
     assert "2024-03-31" in set(wide["period_end"].astype(str))
@@ -219,6 +219,34 @@ def test_display_stack_uses_mark_est_skips_priv_aggregates():
 
     port = portfolio_by_period_frame(hist)
     assert set(port["investee_ticker"]) == {"PRIV_HK_LISTED_INVESTEES_FV"}
+
+
+def test_holdings_qoq_chart_defaults_to_full_named_stack():
+    rows = []
+    for i, t in enumerate(["A", "B", "C", "D", "E", "F", "G", "H", "I"]):
+        rows.append(
+            {
+                "period_end": "2025-09-30",
+                "investee_ticker": t,
+                "action": "hold",
+                "market_value_usd": None,
+                "mark_at_filing_est_usd": float((10 - i) * 1_000_000_000),
+            }
+        )
+    wide = holdings_qoq_chart_frame(pd.DataFrame(rows))
+    tickers = [c for c in wide.columns if c != "period_end"]
+    assert len(tickers) == 9
+    assert tickers == ["A", "B", "C", "D", "E", "F", "G", "H", "I"]
+    wide7 = holdings_qoq_chart_frame(pd.DataFrame(rows), top_n=7)
+    assert [c for c in wide7.columns if c != "period_end"] == [
+        "A",
+        "B",
+        "C",
+        "D",
+        "E",
+        "F",
+        "G",
+    ]
 
 
 def test_display_stack_prefers_eod_mark_over_broker_mv():

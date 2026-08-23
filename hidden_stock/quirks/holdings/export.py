@@ -53,7 +53,7 @@ _MN_COL = re.compile(r"(_mn|_usd_mn|hkd_mn|mkt_cap)", re.I)
 # 13F values that blow up the stacked chart (likely unit/parse artifacts).
 CHART_EXCLUDE_TICKERS = frozenset({"MRDB"})
 # At-a-glance named stack: latest-period top N only (rest omitted, no OTHER).
-HOLDINGS_QOQ_CHART_TOP_N = 7
+HOLDINGS_QOQ_CHART_TOP_N: int | None = None  # full named stack; filter in Sheets
 
 POSITIONS_COLS = [
     "period_end",
@@ -444,10 +444,10 @@ def holdings_qoq_chart_frame(
     top_n: int | None = HOLDINGS_QOQ_CHART_TOP_N,
     exclude_tickers: frozenset[str] | None = None,
 ) -> pd.DataFrame:
-    """Wide $M matrix for ``holdings_qoq_chart`` — calendar quarters, top-N named sizing.
+    """Wide $M matrix for ``holdings_qoq_chart`` — calendar quarters, all named sizing.
 
-    Default ``top_n=7`` (latest quarter by size) so gains are readable at a glance.
-    Pass ``top_n=None`` for the full named universe.
+    Default ``top_n=None`` ships the full named universe (filter top-N in Sheets).
+    Pass an int to cap columns by latest-quarter size.
     """
     qlong = quarterly_display_stack_frame(hist)
     if not qlong.empty:
@@ -846,9 +846,11 @@ def _upsert_qoq_stacked_chart(
     ]
     basis = chart_basis or getattr(chart_df, "attrs", {}).get("chart_basis")
     if basis == "display_estimate_or_broker":
-        title = "Top holdings by calendar quarter ($M)"
+        title = "Named public holdings by calendar quarter ($M)"
+        n = getattr(chart_df, "attrs", {}).get("chart_top_n")
+        scope = f"top {n} by latest size; " if n else "full named stack; "
         subtitle = (
-            f"top {HOLDINGS_QOQ_CHART_TOP_N} by latest size; "
+            f"{scope}"
             "basis=display_estimate_or_broker; not_portfolio_sot; "
             "calendar QoQ (not 13G filing dates)"
         )

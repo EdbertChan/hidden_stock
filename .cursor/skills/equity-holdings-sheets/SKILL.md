@@ -62,7 +62,7 @@ Depth is **calendar years** (`history_lookback_years`), not filing count. `histo
 
 `positions_qoq`, `current_holdings`, `portfolio_by_period`, `holdings_qoq_chart` (+ stacked column chart; **one column per ticker — never `OTHER`**), plus estimated performance tabs:
 
-- `holdings_qoq_chart`: **calendar quarter-ends ≤ today**, **top 7** names by latest size. Display preference: **EOD `mark_at_filing_est_usd` → non-broker `$` → broker `$` last** (`basis=display_estimate_or_broker; not_portfolio_sot`). Rest omitted (no OTHER). Not every 13G filing date. Own tab with chart at top. Dietz / `portfolio_by_period` stay on portfolio SoT. `fanout_13g_hk` default lookback **8** years.
+- `holdings_qoq_chart`: **calendar quarter-ends ≤ today**, **full named public stack** (sorted by latest size; filter top-N in Sheets). Display preference: **EOD `mark_at_filing_est_usd` → non-broker `$` → broker `$` last** (`basis=display_estimate_or_broker; not_portfolio_sot`). No OTHER bucket. Not every 13G filing date. Own tab with chart at top. Dietz / `portfolio_by_period` stay on portfolio SoT. `fanout_13g_hk` default lookback **8** years.
 - `returns_by_period` — portfolio MV, net external flow, **MTM** (primary), avg-cost + FIFO disposal estimates, Modified Dietz; **Dietz combo chart embeds here** (`dietz_return_pct` + `cum_dietz_growth`; estimated linked Dietz / CAGR subtitle)
 - `realized_pnl_qoq` — disposal events with `cost_method=avg|fifo` (avg is primary; FIFO sensitivity). No separate realized chart tabs (empty/zero for 13G-null-`$` parents).
 - `holding_returns` — per ticker × period weight, Dietz, contribution, MTM, avg/FIFO realized
