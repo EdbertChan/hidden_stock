@@ -38,6 +38,46 @@ def test_parse_bili_sc13ga_exit_zeros():
     assert parsed.get("exit") is True
 
 
+# Continuing SC 13G/A that still owns >5% but includes Item 5 *form instructions*
+# (DIDIY accession 0001193125-24-021343 class — false exit from boilerplate).
+DIDI_CONTINUING_HTML = """
+<html><body>
+DiDi Global Inc. (Name of Issuer)
+CUSIP No. 23292E108
+Aggregate Amount Beneficially Owned by Each Reporting Person
+80,525,983
+10 Check Box if the Aggregate Amount in Row (9) Excludes Certain Shares
+Percent of Class Represented by Amount in Row (9)
+7.3%
+12 Type of Reporting Person (See Instructions) CO
+Item 5. Ownership of Five Percent or Less of a Class.
+If this statement is being filed to report the fact that as of the date hereof
+the reporting person has ceased to be the beneficial owner of more than five
+percent of the class of securities, check the following:
+</body></html>
+"""
+
+
+def test_parse_didi_continuing_not_exit_despite_item5_boilerplate():
+    parsed = parse_13g_html(DIDI_CONTINUING_HTML)
+    assert parsed["ownership_pct"] == 7.3
+    assert parsed["shares"] == 80_525_983.0
+    assert parsed.get("exit") is not True
+
+    pos = raw_to_position(
+        parsed,
+        parent_ticker="TCEHY",
+        form="SC 13G/A",
+        acc="0001193125-24-021343",
+        filing_date="2024-02-01",
+        cik="0001293451",
+    )
+    assert pos is not None
+    assert pos["shares_held"] == 80_525_983.0
+    assert pos["ownership_pct"] == 7.3
+    assert "13g_exit=1" not in str(pos["note"])
+
+
 def test_raw_to_position_exit_no_presence_proxy():
     parsed = parse_13g_html(BILI_EXIT_HTML)
     pos = raw_to_position(

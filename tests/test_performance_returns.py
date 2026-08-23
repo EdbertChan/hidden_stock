@@ -407,10 +407,13 @@ def test_linked_dietz_cagr_four_quarters_plus_10pct():
     ]
     df = pd.DataFrame(rows)
     info = linked_dietz_cagr(df)
-    assert info["years"] == pytest.approx(1.0)
-    expected = (1.1**4) ** (1.0 / 1.0) - 1.0
+    # Calendar span from first portfolio period (2024-03-31) through last cum.
+    assert info["start_period"] == "2024-03-31"
+    assert info["end_period"] == "2025-03-31"
+    assert info["years"] == pytest.approx(1.0, abs=0.002)
+    expected = (1.1**4) ** (1.0 / info["years"]) - 1.0
     assert info["cagr"] == pytest.approx(expected, rel=1e-9)
-    assert abs(info["cagr"] - 0.4641) < 1e-3
+    assert abs(info["cagr"] - 0.4641) < 2e-3
 
     chart = returns_chart_frame(df)
     assert list(chart.columns) == ["period_end", "dietz_return_pct", "cum_growth_index"]
@@ -420,6 +423,10 @@ def test_linked_dietz_cagr_four_quarters_plus_10pct():
     assert any(
         str(x).startswith("CAGR") for x in with_footer["period_end"].tolist()
     )
+    cagr_row = with_footer[
+        with_footer["period_end"].astype(str).str.startswith("CAGR")
+    ].iloc[0]
+    assert pd.isna(cagr_row["cum_growth_index"]) or cagr_row["cum_growth_index"] is None
     frames = performance_frames(pd.DataFrame())
     assert "returns_chart" in frames
     assert "realized_chart" in frames

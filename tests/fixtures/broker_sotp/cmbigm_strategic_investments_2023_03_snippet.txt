@@ -1,0 +1,11 @@
+Figure: Tencent: valuation of strategic investments
+Name Ticker Tencent's stake % Mkt cap (US$mn) Value to Tencent (HK$mn)
+PDD Holdings Inc PDD US 15.5 99,798 120,578
+Sea Ltd SE US 20.2 44,860 70,682
+Kuaishou Technology 1024 HK 20.6 30,884 49,720
+Meituan 3690 HK 3.6 103,688 29,277
+Snap Inc SNAP US 17.5 17,996 24,606
+Listed investments (current value) 470,454
+Unlisted investments (book value) 373,858
+Source: Bloomberg, Company data, CMBIGM estimates
+Note: data as of the market close on 21 March

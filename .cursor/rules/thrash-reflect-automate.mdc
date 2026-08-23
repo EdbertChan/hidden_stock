@@ -5,16 +5,18 @@ alwaysApply: true
 
 # Thrash → reflect + automate (no re-prompt)
 
-When a **swarm grade**, **test thrash**, or **FAIL / NEEDS_WORK board** happens
-in this repo, follow `.cursor/skills/thrash-reflect-automate/SKILL.md`.
+When a **sheet-swarm grade**, **pipeline-swarm** board, **test thrash**, or
+**FAIL / NEEDS_WORK board** happens in this repo, follow
+`.cursor/skills/thrash-reflect-automate/SKILL.md`.
 
 Do **not** wait for the user to paste the long “after every failure /reflect
 and /automate-me” phrase.
 
 ## Collapse phrase
 
-User shortcut: `/thrash` or any holdings swarm FAIL implies that skill’s auto
-sequence (reflect → class fix → skill assert → short automate → re-grade).
+User shortcut: `/thrash` or any holdings sheet-swarm / pipeline-swarm FAIL
+implies that skill’s auto sequence (reflect → class fix → skill assert →
+short automate → re-grade).
 
 ## Do not
 

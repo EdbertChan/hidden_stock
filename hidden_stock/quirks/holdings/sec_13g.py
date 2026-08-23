@@ -9,47 +9,29 @@ from xml.etree import ElementTree as ET
 
 import requests
 
-# Shared issuer name → ticker hints (Tencent + common US strategic stakes).
-ISSUER_TICKER_HINTS: dict[str, str | None] = {
-    "kanzhun": "BZ",
-    "ke holdings": "BEKE",
-    "reddit": "RDDT",
-    "cango": "CANG",
-    "horizon quantum": None,
-    "pinduoduo": "PDD",
-    "pdd holdings": "PDD",
-    "sea limited": "SE",
-    "spotify": "SPOT",
-    "meituan": "3690.HK",
-    "vipshop": "VIPS",
-    "nio": "NIO",
-    "bilibili": "BILI",
-    "tencent music": "TME",
-    "huya": "HUYA",
-    "cheetah": "CMCM",
-    "global blue": "GB",
-    "cheche": "CCG",
-    "didi": "DIDIY",
-    "didi global": "DIDIY",
-    "aurora innovation": "AUR",
-    "grab holdings": "GRAB",
-    "lucid group": "LCID",
-    "weride": "WRD",
-    "serve robotics": "SERV",
-    "neutron holdings": None,  # Lime — private
-    "xpeng": "XPEV",
-    "perfect corp": "PERF",
-    "baozun": "BZUN",
-    "momo": "MOMO",
-    "hello group": "MOMO",
-    "groupon": "GRPN",
-    "smart share": "EM",
-    "mariadb": "MRDB",
-    "best inc": "BEST",
-    "joby aviation": "JOBY",
-    "marqeta": "MQ",
-    "rivian": "RIVN",
-}
+from .identity import (
+    ISSUER_TICKER_HINTS,
+    clean_issuer_name,
+    holding_key,
+    resolve_issuer_ticker,
+)
+
+# Re-export identity helpers for existing imports.
+__all__ = [
+    "ISSUER_TICKER_HINTS",
+    "clean_issuer_name",
+    "resolve_issuer_ticker",
+    "forms_ok",
+    "parse_13g_html",
+    "parse_13g_xml",
+    "parse_filing_body",
+    "raw_to_position",
+    "raw_to_live_row",
+    "collect_13g_period_snapshots",
+    "fetch_latest_13g_holdings",
+    "exited_tickers_as_of",
+    "positions_as_of",
+]
 
 _MONTH_NAMES = {
     "january",
@@ -84,21 +66,38 @@ def forms_ok() -> set[str]:
     }
 
 
-def resolve_issuer_ticker(name: str | None, ticker: str | None) -> str | None:
-    if ticker:
-        return str(ticker).strip().upper()
-    if not name:
-        return None
-    from .extract import load_investee_aliases, resolve_investee_ticker
-
-    resolved = resolve_investee_ticker(name, None, load_investee_aliases())
-    if resolved:
-        return resolved
-    key = name.strip().lower()
-    for alias, sym in ISSUER_TICKER_HINTS.items():
-        if alias in key:
-            return sym
-    return None
+def _apply_exit_flags(out: dict, text: str = "") -> None:
+    """Stamp ``exit`` only when quantity confirms — never Item 5 form boilerplate alone."""
+    pct = out.get("ownership_pct")
+    shares = out.get("shares")
+    positive_stake = (shares is not None and float(shares) > 0) and (
+        pct is not None and float(pct) > 0
+    )
+    zero_qty = (pct is not None and float(pct) <= 0) or (
+        shares is not None and float(shares) <= 0
+    )
+    disposal_language = bool(
+        text
+        and re.search(
+            r"no longer owns?\s+any|are no longer beneficial owners?",
+            text,
+            re.I,
+        )
+    )
+    item5_checked = bool(
+        text
+        and re.search(
+            r"ceased to be the beneficial owner of more than five percent"
+            r"[^☒\[\]xX]{0,120}(?:☒|\[[\sxX]\])",
+            text,
+            re.I | re.S,
+        )
+    )
+    if positive_stake:
+        out.pop("exit", None)
+        return
+    if zero_qty or disposal_language or item5_checked:
+        out["exit"] = True
 
 
 def parse_13g_xml(xml_text: str) -> dict:
@@ -126,6 +125,7 @@ def parse_13g_xml(xml_text: str) -> dict:
                 out["shares"] = float(re.sub(r"[^0-9.]", "", text))
             except (TypeError, ValueError):
                 pass
+    _apply_exit_flags(out)
     return out
 
 
@@ -198,24 +198,7 @@ def parse_13g_html(html_text: str) -> dict:
     if m:
         out["ticker"] = m.group("sym")
 
-    # Cessation / exit: 0%/0 shares, Item 5 language, or Item 4 "no longer owns".
-    pct = out.get("ownership_pct")
-    shares = out.get("shares")
-    cessation = bool(
-        re.search(
-            r"ceased to be the beneficial owner of more than five percent",
-            text,
-            re.I,
-        )
-        or re.search(
-            r"no longer owns?\s+any|no longer beneficial owners?",
-            text,
-            re.I,
-        )
-    )
-    if cessation or (pct is not None and float(pct) <= 0) or (shares is not None and float(shares) <= 0):
-        out["exit"] = True
-
+    _apply_exit_flags(out, text)
     return out
 
 
@@ -260,12 +243,16 @@ def raw_to_live_row(
     name = parsed.get("issuer_name")
     if not name:
         return None
+    name = clean_issuer_name(name) or name
     if is_self_issuer(parsed, parent_ticker=parent_ticker):
         return None
-    ticker = resolve_issuer_ticker(name, parsed.get("ticker"))
-    pct = parsed.get("ownership_pct")
     cusip = (parsed.get("cusip") or "").strip().upper() or None
+    ticker = resolve_issuer_ticker(name, parsed.get("ticker"), cusip=cusip)
+    pct = parsed.get("ownership_pct")
     shares = parsed.get("shares")
+    note = f"source=13g form={form} cik={cik}"
+    if ticker and str(ticker).startswith("PRIV_") and "ticker=private_note" not in note:
+        note = f"{note}; ticker=private_note"
     return {
         "parent_ticker": parent_ticker,
         "investee_name": name,
@@ -281,7 +268,7 @@ def raw_to_live_row(
         "first_accession_no": acc,
         "source_quote": f"{form} {acc}: {name} {pct}%",
         "confidence": "medium",
-        "note": f"source=13g form={form} cik={cik}",
+        "note": note,
         "filing_gaap_hint": "fv_ni" if (pct or 0) < 20 else None,
         "influence_disclosed": bool((pct or 0) >= 20),
         "_source": "13g",
@@ -317,9 +304,16 @@ def raw_to_position(
     pct = live.get("ownership_pct")
     shares = live.get("shares_held")
     note = str(live.get("note") or "")
-    is_exit = bool(parsed.get("exit")) or (
-        pct is not None and float(pct) <= 0
-    ) or (shares is not None and float(shares) <= 0)
+    # Defense in depth: positive Aggregate Amount + % never becomes an exit
+    # even if HTML heuristics misfire (Item 5 boilerplate class).
+    positive_stake = (shares is not None and float(shares) > 0) and (
+        pct is not None and float(pct) > 0
+    )
+    is_exit = (not positive_stake) and (
+        bool(parsed.get("exit"))
+        or (pct is not None and float(pct) <= 0)
+        or (shares is not None and float(shares) <= 0)
+    )
 
     # Never write ownership_% into shares_held (Neutron / EM / ANT class).
     # QoQ continuity uses ownership_pct via diff_snapshots._continuity_qty.
@@ -498,7 +492,7 @@ def collect_13g_period_snapshots(
     lookback_start: str | None = None,
 ) -> tuple[list[tuple[str, str, str, list[dict]]], dict[str, Any]]:
     """Oldest→newest running issuer map from Schedule 13D/G amendments."""
-    from .history import _key
+    _key = holding_key
     from .lookback import date_on_or_after
 
     meta: dict[str, Any] = {
@@ -526,6 +520,7 @@ def collect_13g_period_snapshots(
     running: dict[str, dict] = {}
     exited_tickers: set[str] = set()
     exited_by_date: dict[str, list[str]] = {}
+    exit_events: dict[str, dict[str, str]] = {}
     by_period: dict[str, tuple[str, str, str, list[dict]]] = {}
 
     for filing_date, form, acc, primary in items:
@@ -557,10 +552,22 @@ def collect_13g_period_snapshots(
             or (pct is not None and float(pct) <= 0)
             or (shares is not None and float(shares) <= 0)
         )
+        # Positive stake can never be an exit (defense vs stale notes).
+        if (
+            shares is not None
+            and float(shares) > 0
+            and pct is not None
+            and float(pct) > 0
+        ):
+            is_exit = False
         if is_exit:
             running.pop(k, None)
             if ticker:
                 exited_tickers.add(ticker)
+                exit_events[ticker] = {
+                    "accession": acc,
+                    "filing_date": filing_date,
+                }
         else:
             running[k] = pos
             if ticker:
@@ -576,6 +583,7 @@ def collect_13g_period_snapshots(
     ordered = [by_period[k] for k in sorted(by_period.keys())]
     meta["num_periods"] = len(ordered)
     meta["exited_by_date"] = exited_by_date
+    meta["exit_events"] = exit_events
     return ordered, meta
 
 

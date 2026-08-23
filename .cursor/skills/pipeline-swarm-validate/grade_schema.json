@@ -1,7 +1,19 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["judge", "verdict", "score", "blocking_issues", "minor_issues", "what_looks_good", "checks", "summary", "recommended_fixes", "root_cause_class", "avoid_next_time"],
+  "required": [
+    "judge",
+    "verdict",
+    "score",
+    "blocking_issues",
+    "minor_issues",
+    "what_looks_good",
+    "checks",
+    "summary",
+    "recommended_fixes",
+    "root_cause_class",
+    "avoid_next_time"
+  ],
   "properties": {
     "judge": { "type": "string" },
     "verdict": { "type": "string", "enum": ["pass", "fail", "needs_work"] },
@@ -35,30 +47,25 @@
     "what_looks_good": { "type": "array", "items": { "type": "string" } },
     "checks": {
       "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "didi_2026_06_30_fv",
-        "grab_aurora_vs_10q",
-        "aur_one_per_period",
-        "no_otc_invent_marks",
-        "chart_ranking_sane"
-      ],
+      "additionalProperties": true,
       "properties": {
-        "didi_2026_06_30_fv": { "type": "string", "enum": ["pass", "fail", "unknown"] },
-        "grab_aurora_vs_10q": { "type": "string", "enum": ["pass", "fail", "unknown"] },
-        "aur_one_per_period": { "type": "string", "enum": ["pass", "fail", "unknown"] },
-        "no_otc_invent_marks": { "type": "string", "enum": ["pass", "fail", "unknown"] },
-        "chart_ranking_sane": { "type": "string", "enum": ["pass", "fail", "unknown"] }
+        "units_hkd_mn": { "type": "string", "enum": ["pass", "fail", "unknown"] },
+        "pdf_window": { "type": "string", "enum": ["pass", "fail", "unknown"] },
+        "pdd_child_band": { "type": "string", "enum": ["pass", "fail", "unknown"] },
+        "parent_vs_child": { "type": "string", "enum": ["pass", "fail", "unknown"] },
+        "broker_provenance": { "type": "string", "enum": ["pass", "fail", "unknown"] },
+        "no_otc_invent_marks": { "type": "string", "enum": ["pass", "fail", "unknown"] }
       }
     },
     "summary": { "type": "string" },
     "recommended_fixes": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "1–3 concrete code/data actions on FAIL/NEEDS_WORK"
+      "description": "1–3 concrete code/data actions (file/function when possible)"
     },
     "root_cause_class": {
-      "type": ["string", "null"]
+      "type": ["string", "null"],
+      "description": "e.g. unit_mixup, parent_child_column_confusion, wrong_pdf_window"
     },
     "avoid_next_time": {
       "type": ["string", "null"],

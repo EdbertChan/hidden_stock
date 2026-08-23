@@ -256,6 +256,13 @@ def _portfolio_mv_by_period(history_rows: list[dict]) -> dict[str, float]:
     for r in history_rows:
         if str(r.get("action") or "") == "exit":
             continue
+        try:
+            from .composition import excluded_from_portfolio_mv
+
+            if excluded_from_portfolio_mv(r):
+                continue
+        except Exception:
+            pass
         mv = _f(r.get("market_value_usd"))
         if mv is None:
             continue
@@ -265,22 +272,143 @@ def _portfolio_mv_by_period(history_rows: list[dict]) -> dict[str, float]:
     return dict(by)
 
 
-def _flows_by_period_ticker(history_rows: list[dict]) -> dict[tuple[str, str], float]:
-    """Net external flow at period prices: +buy_value, −sell_value."""
+def _flows_by_period_ticker(
+    history_rows: list[dict],
+) -> tuple[dict[tuple[str, str], float], set[str]]:
+    """Net external flow at period prices: +buy_value, −sell_value.
+
+    Also books **coverage** flows for MV-only rows (no share counts) when a
+    name appears or disappears — HK annual aggregates, Investments-table marks —
+    so a newly disclosed line is not phantom MTM.
+
+    When MV-only identities **replace** each other in the same period (e.g.
+    PRIV_HK_LISTED_ASSOCIATES → PRIV_HK_LISTED_INVESTEES_FV), that is a
+    disclosure/basis switch — not cash. Skip coverage flows for that period and
+    return it in ``series_breaks`` so callers reset the linked Dietz segment.
+    """
     flows: dict[tuple[str, str], float] = defaultdict(float)
+    share_based: set[str] = set()
+    mv_tt: dict[tuple[str, str], float] = {}
     for r in history_rows:
-        if str(r.get("action") or "") == "ratio_adj":
-            continue  # share restatement, not cash/share flow
         t = _ticker_key(r)
         pe = str(r.get("period_end") or "")
         if not t or not pe:
             continue
+        try:
+            from .composition import excluded_from_portfolio_mv, is_hk_residual_ticker
+
+            if excluded_from_portfolio_mv(r) or is_hk_residual_ticker(t):
+                continue
+        except Exception:
+            pass
+        if str(r.get("action") or "") == "ratio_adj":
+            continue  # share restatement, not cash/share flow
+        sh = _f(r.get("shares_held"))
+        sp = _f(r.get("shares_prev"))
+        if (sh is not None and sh > 0) or (sp is not None and sp > 0):
+            share_based.add(t)
+        if str(r.get("action") or "") != "exit":
+            mv = _f(r.get("market_value_usd"))
+            if mv is not None:
+                mv_tt[(pe, t)] = mv_tt.get((pe, t), 0.0) + float(mv)
         delta = _share_delta(r)
         px = period_price(r)
         if px is None or abs(delta) < 1e-12:
             continue
         flows[(pe, t)] += float(delta) * float(px)
-    return dict(flows)
+
+    # Coverage inception / drop for MV-only identities (no share ledger).
+    periods = sorted({pe for pe, _t in mv_tt})
+    prev_tickers: set[str] = set()
+    prev_mv: dict[str, float] = {}
+    series_breaks: set[str] = set()
+    for pe in periods:
+        cur_mv = {t: mv for (p, t), mv in mv_tt.items() if p == pe}
+        cur_tickers = set(cur_mv)
+        appearing = {t for t in cur_tickers - prev_tickers if t not in share_based}
+        disappearing = {
+            t for t in prev_tickers - cur_tickers if t not in share_based
+        }
+        if appearing and disappearing:
+            # Basis/disclosure switch (associates FV → all-listed investees FV).
+            series_breaks.add(pe)
+        else:
+            for t in appearing:
+                flows[(pe, t)] += float(cur_mv[t])
+            for t in disappearing:
+                flows[(pe, t)] -= float(prev_mv.get(t, 0.0))
+        prev_tickers = cur_tickers
+        prev_mv = cur_mv
+    return dict(flows), series_breaks
+
+
+def linked_dietz_cagr(
+    returns_by_period: pd.DataFrame,
+    *,
+    series_breaks: set[str] | None = None,
+) -> dict[str, Any]:
+    """CAGR from linked Dietz: cum_end^(1/years) − 1.
+
+    ``years`` is calendar span from the start of the **latest unbroken**
+    Dietz segment (first portfolio period, or last ``series_break`` period)
+    through the last period with linked growth — not ``n/4``.
+    """
+    empty = {
+        "cagr": None,
+        "years": None,
+        "cum_end": None,
+        "start_period": None,
+        "end_period": None,
+    }
+    if returns_by_period is None or len(returns_by_period) == 0:
+        return empty
+    df = returns_by_period.copy().sort_values("period_end", kind="mergesort")
+    with_cum = df[df["cum_dietz_growth"].notna()]
+    if len(with_cum) < 1:
+        return empty
+    breaks = {str(x) for x in (series_breaks or set())}
+    # Prefer break stamped on the returns note when caller did not pass breaks.
+    if not breaks and "note" in df.columns:
+        for _, row in df.iterrows():
+            if "series_break=coverage_basis" in str(row.get("note") or ""):
+                breaks.add(str(row["period_end"]))
+    start_pe = str(df.iloc[0]["period_end"])
+    if breaks:
+        # Segment starts at the break period (new coverage basis inception).
+        last_break = max(breaks)
+        if last_break <= str(with_cum.iloc[-1]["period_end"]):
+            start_pe = last_break
+    end_pe = str(with_cum.iloc[-1]["period_end"])
+    # Cum growth for CAGR must be within the same unbroken segment.
+    seg = with_cum[with_cum["period_end"].astype(str) >= start_pe]
+    if len(seg) < 1:
+        seg = with_cum
+        start_pe = str(df.iloc[0]["period_end"])
+    # Re-base: growth from segment start. If break row has cum=1.0, use last/first.
+    cum_end = float(seg.iloc[-1]["cum_dietz_growth"])
+    cum_start = float(seg.iloc[0]["cum_dietz_growth"])
+    if cum_start > 0 and start_pe in breaks:
+        # Break row is the new base (cum≈1); later rows are absolute from reset.
+        rebased = cum_end / cum_start if cum_start else cum_end
+    elif cum_start > 0 and start_pe == str(df.iloc[0]["period_end"]):
+        rebased = cum_end  # absolute from inception (first cum often null→skipped)
+    else:
+        rebased = cum_end / cum_start if cum_start else cum_end
+    try:
+        years = (pd.Timestamp(end_pe) - pd.Timestamp(start_pe)).days / 365.25
+    except (TypeError, ValueError):
+        years = None
+    if years is None or years <= 0 or rebased <= 0:
+        cagr = None
+    else:
+        cagr = rebased ** (1.0 / years) - 1.0
+    return {
+        "cagr": cagr,
+        "years": years,
+        "cum_end": rebased,
+        "start_period": start_pe,
+        "end_period": end_pe,
+    }
 
 
 def _sum_realized_by_period(
@@ -328,7 +456,7 @@ def period_portfolio_returns(
     avg_by = _sum_realized_by_period(realized_events, "avg")
     fifo_by = _sum_realized_by_period(realized_events, "fifo")
 
-    flows_tt = _flows_by_period_ticker(history_rows)
+    flows_tt, series_breaks = _flows_by_period_ticker(history_rows)
     flow_by_pe: dict[str, float] = defaultdict(float)
     for (pe, _t), f in flows_tt.items():
         flow_by_pe[pe] += f
@@ -342,14 +470,26 @@ def period_portfolio_returns(
         end_mv = mv[pe]
         start_mv = mv[prev_pe] if prev_pe is not None else 0.0
         net_flow = float(flow_by_pe.get(pe, 0.0))
-        if prev_pe is None:
+        break_here = pe in series_breaks and prev_pe is not None
+        if prev_pe is None or break_here:
+            # Inception or coverage-basis series break — not cash / not MTM.
             mtm = 0.0
             dietz = None
             net_flow_display = end_mv
+            cum_growth = 1.0
+            note = NOTE_EST
+            if break_here:
+                note = (
+                    f"{NOTE_EST}; series_break=coverage_basis; "
+                    "disclosure_switch_not_cash"
+                )
+            start_display = None
         else:
             mtm = end_mv - start_mv - net_flow
             dietz = _dietz_return(start_mv, end_mv, net_flow)
             net_flow_display = net_flow
+            note = NOTE_EST
+            start_display = start_mv
         avg_r = float(avg_by.get(pe, 0.0))
         fifo_r = float(fifo_by.get(pe, 0.0))
         cum_avg += avg_r
@@ -359,7 +499,7 @@ def period_portfolio_returns(
         rows_out.append(
             {
                 "period_end": pe,
-                "portfolio_mv_start": start_mv if prev_pe else None,
+                "portfolio_mv_start": start_display,
                 "portfolio_mv_end": end_mv,
                 "net_external_flow": net_flow_display,
                 "mtm_pnl": mtm,
@@ -371,8 +511,12 @@ def period_portfolio_returns(
                 "cum_realized_pnl_avg_est": cum_avg,
                 "cum_realized_pnl_fifo_est": cum_fifo,
                 "cum_realized_pnl_est": cum_avg,
-                "cum_dietz_growth": cum_growth if prev_pe else None,
-                "note": NOTE_EST,
+                "cum_dietz_growth": (
+                    1.0
+                    if break_here
+                    else (cum_growth if prev_pe else None)
+                ),
+                "note": note,
             }
         )
         prev_pe = pe
@@ -404,7 +548,7 @@ def holding_period_returns(
 ) -> pd.DataFrame:
     """Per ticker × period: weight, Dietz, contribution, MTM, avg+fifo realized."""
     mv_port = _portfolio_mv_by_period(history_rows)
-    flows_tt = _flows_by_period_ticker(history_rows)
+    flows_tt, series_breaks = _flows_by_period_ticker(history_rows)
 
     mv_tt: dict[tuple[str, str], float] = {}
     meta_tt: dict[tuple[str, str], dict] = {}
@@ -436,6 +580,7 @@ def holding_period_returns(
     out: list[dict] = []
     for pe in periods:
         port_end = mv_port.get(pe) or 0.0
+        break_here = pe in series_breaks
         tickers = sorted({t for (p, t) in mv_tt if p == pe} | set(prev_mv_t.keys()))
         for t in tickers:
             end_mv = mv_tt.get((pe, t), 0.0)
@@ -443,7 +588,15 @@ def holding_period_returns(
             net_flow = float(flows_tt.get((pe, t), 0.0))
             if start_mv <= 0 and end_mv <= 0 and abs(net_flow) < 1e-6:
                 continue
-            if start_mv <= 0:
+            # Coverage-basis switch: omit artificial −100% exit on the old aggregate.
+            if break_here and end_mv <= 0 and start_mv > 0:
+                continue
+            note = NOTE_EST
+            if break_here and start_mv <= 0:
+                mtm = 0.0
+                dietz = None
+                note = f"{NOTE_EST}; series_break=coverage_basis"
+            elif start_mv <= 0:
                 mtm = 0.0
                 dietz = None
             else:
@@ -467,7 +620,7 @@ def holding_period_returns(
                     "realized_pnl_fifo_est": float(fifo_tt.get((pe, t), 0.0)),
                     "realized_pnl_est": avg_r,
                     "filing_url": src.get("filing_url"),
-                    "note": NOTE_EST,
+                    "note": note,
                 }
             )
         prev_mv_t = {t: mv_tt[(pe, t)] for (p, t) in mv_tt if p == pe}
@@ -577,6 +730,9 @@ def reported_vs_est_frame(
     """Reconcile company-reported investment income vs summed calendar MTM.
 
     Residual is expected to be large; this is not an equality gate.
+
+    When no income table exists (TCEHY class), fall back to Note 22 /
+    HK-annual portfolio FV vs portfolio_mv_end (should nearly match).
     """
     cols = [
         "period_label",
@@ -588,30 +744,62 @@ def reported_vs_est_frame(
         "note",
     ]
     reported = load_reported_investment_income(parent)
-    if len(reported) == 0:
-        return pd.DataFrame(columns=cols)
-
-    returns = period_portfolio_returns(history_rows, build_lots_and_realized(history_rows)[1])
-    out: list[dict] = []
-    for _, rep in reported.iterrows():
-        start = str(rep.get("calendar_start") or "")
-        end = str(rep.get("calendar_end") or "")
-        mask = (returns["period_end"].astype(str) >= start) & (
-            returns["period_end"].astype(str) <= end
+    if len(reported) > 0:
+        returns = period_portfolio_returns(
+            history_rows, build_lots_and_realized(history_rows)[1]
         )
-        our_mtm = float(returns.loc[mask, "mtm_pnl"].sum()) if len(returns) else 0.0
-        company = rep.get("amount_usd")
-        company_f = float(company) if company is not None and company == company else None
-        residual = (our_mtm - company_f) if company_f is not None else None
+        out: list[dict] = []
+        for _, rep in reported.iterrows():
+            start = str(rep.get("calendar_start") or "")
+            end = str(rep.get("calendar_end") or "")
+            mask = (returns["period_end"].astype(str) >= start) & (
+                returns["period_end"].astype(str) <= end
+            )
+            our_mtm = float(returns.loc[mask, "mtm_pnl"].sum()) if len(returns) else 0.0
+            company = rep.get("amount_usd")
+            company_f = float(company) if company is not None and company == company else None
+            residual = (our_mtm - company_f) if company_f is not None else None
+            out.append(
+                {
+                    "period_label": rep.get("period_label"),
+                    "fiscal_year_end": rep.get("fiscal_year_end"),
+                    "company_reported_usd": company_f,
+                    "company_reported_rmb_million": rep.get("amount_rmb_million"),
+                    "our_mtm_sum_usd": our_mtm,
+                    "residual_usd": residual,
+                    "note": NOTE_RECON,
+                }
+            )
+        return pd.DataFrame(out, columns=cols)
+
+    # HK annual / Note 22 FV: company_reported = disclosed aggregate $, our = portfolio end.
+    mv = _portfolio_mv_by_period(history_rows)
+    if not mv:
+        return pd.DataFrame(columns=cols)
+    hk_notes = []
+    for r in history_rows:
+        note = str(r.get("note") or "")
+        if "value_source=hk_annual_note22" in note or "source=hk_annual" in note:
+            pe = str(r.get("period_end") or "")
+            if pe and pe in mv:
+                hk_notes.append(pe)
+    if not hk_notes:
+        return pd.DataFrame(columns=cols)
+    out = []
+    for pe in sorted(set(hk_notes)):
+        end_mv = float(mv[pe])
         out.append(
             {
-                "period_label": rep.get("period_label"),
-                "fiscal_year_end": rep.get("fiscal_year_end"),
-                "company_reported_usd": company_f,
-                "company_reported_rmb_million": rep.get("amount_rmb_million"),
-                "our_mtm_sum_usd": our_mtm,
-                "residual_usd": residual,
-                "note": NOTE_RECON,
+                "period_label": f"FY{pe[:4]} Note22 FV",
+                "fiscal_year_end": pe,
+                "company_reported_usd": end_mv,
+                "company_reported_rmb_million": None,
+                "our_mtm_sum_usd": end_mv,  # identity: portfolio is the Note 22 stamp
+                "residual_usd": 0.0,
+                "note": (
+                    "hk_annual_note22 portfolio FV vs sheet portfolio_mv_end; "
+                    "not investment-income recon"
+                ),
             }
         )
     return pd.DataFrame(out, columns=cols)
@@ -632,45 +820,6 @@ def returns_chart_frame(returns_by_period: pd.DataFrame) -> pd.DataFrame:
         }
     )
     return out[cols]
-
-
-def linked_dietz_cagr(returns_by_period: pd.DataFrame) -> dict[str, Any]:
-    """CAGR from linked Dietz: cum_end^(1/years) − 1.
-
-    ``years`` = (# of finite QoQ Dietz returns) / 4 — each return is one quarter.
-    """
-    empty = {
-        "cagr": None,
-        "years": None,
-        "cum_end": None,
-        "start_period": None,
-        "end_period": None,
-    }
-    if returns_by_period is None or len(returns_by_period) == 0:
-        return empty
-    df = returns_by_period.copy()
-    df = df[df["dietz_return"].notna()].sort_values("period_end", kind="mergesort")
-    if len(df) < 1:
-        return empty
-    with_cum = df[df["cum_dietz_growth"].notna()]
-    if len(with_cum) < 1:
-        return empty
-    start_pe = str(with_cum.iloc[0]["period_end"])
-    end_pe = str(with_cum.iloc[-1]["period_end"])
-    cum_end = float(with_cum.iloc[-1]["cum_dietz_growth"])
-    n_q = len(with_cum)
-    years = n_q / 4.0
-    if years <= 0 or cum_end <= 0:
-        cagr = None
-    else:
-        cagr = cum_end ** (1.0 / years) - 1.0
-    return {
-        "cagr": cagr,
-        "years": years,
-        "cum_end": cum_end,
-        "start_period": start_pe,
-        "end_period": end_pe,
-    }
 
 
 def returns_chart_with_cagr_footer(returns_by_period: pd.DataFrame) -> pd.DataFrame:
@@ -701,7 +850,7 @@ def returns_chart_with_cagr_footer(returns_by_period: pd.DataFrame) -> pd.DataFr
         footer = {
             "period_end": "CAGR (estimated Dietz)",
             "dietz_return_pct": float(cagr) * 100.0,
-            "cum_growth_index": years,
+            "cum_growth_index": None,  # years live in the note row, not this column
         }
         note_row = {
             "period_end": (

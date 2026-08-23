@@ -13,6 +13,7 @@ from .extract import (
     ownership_disclosure_slices,
     resolve_investee_ticker,
 )
+from .identity import holding_key as _norm_key
 from .mtm import apply_gaap_and_adj
 from .parse_notes import parse_investment_notes
 from .parents import normalize_parent, uses_hk_aggregates
@@ -26,17 +27,6 @@ PARENT_CIK_OVERRIDES: dict[str, str] = {
 }
 
 
-def _norm_key(row: dict) -> str:
-    ticker = (row.get("investee_ticker") or "").strip().upper()
-    if ticker:
-        return f"t:{ticker}"
-    cusip = (row.get("_cusip") or row.get("cusip") or "").strip().upper()
-    if cusip:
-        return f"c:{cusip}"
-    name = re.sub(r"[^a-z0-9]+", "", (row.get("investee_name") or "").lower())
-    return f"n:{name}"
-
-
 def _is_13f_source(src: str) -> bool:
     return src in {"13f", "sec_api_13f"} or str(src).startswith("13f") or str(src).startswith(
         "sec_api_13f"
@@ -44,12 +34,16 @@ def _is_13f_source(src: str) -> bool:
 
 
 def _source_allows_chart_dollars(src: str | None, note: str | None = None) -> bool:
-    """Only Investments-table (or 13F) may populate market_value from note fields."""
+    """Only Investments-table / HK annual FV (or 13F) may populate market_value from note fields."""
     blob = f"{src or ''} {note or ''}".lower()
-    if "13f" in blob and "investments_table" not in blob:
+    if "13f" in blob and "investments_table" not in blob and "hk_annual" not in blob:
         # 13F market_value is set directly; this gate is for note→$ mapping
         return False
-    return "investments_table" in blob
+    return (
+        "investments_table" in blob
+        or "hk_annual" in blob
+        or "hk_annual_note22" in blob
+    )
 
 
 def _apply_disclosed_fv(row: dict) -> None:
