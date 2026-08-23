@@ -191,6 +191,11 @@ def test_ci_merge_13f_wins_dollars_13g_fills_ownership_notes_fill_didi_fv():
     assert by["AUR"].get("ownership_pct") == 10.9
     assert by["DIDIY"]["market_value_usd"] == 1_900_000_000.0
     assert sum(1 for r in live if r.get("investee_ticker") == "AUR") == 1
+    # ownership_pct_provenance_not_preserved (real BABA grade finding, 2026-08-22):
+    # GRAB/AUR are 13F-primary rows whose ownership_pct is filled in from a
+    # separate 13G row — the note must not claim the % came from 13F alone.
+    assert "13g" in str(by["GRAB"].get("note") or "").lower()
+    assert "13g" in str(by["AUR"].get("note") or "").lower()
 
     merged = _merge_period_rows(f13, g13, notes)
     tickers = [r["investee_ticker"] for r in merged]

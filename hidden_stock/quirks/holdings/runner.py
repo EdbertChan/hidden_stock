@@ -112,6 +112,7 @@ def merge_raw_holdings(parts: list[list[dict]]) -> list[dict]:
                     ticker_key[t] = key
                 continue
             out = dict(prev)
+            prev_had_ownership_pct = prev.get("ownership_pct") is not None
             for k, v in raw.items():
                 if v is None:
                     continue
@@ -146,6 +147,17 @@ def merge_raw_holdings(parts: list[list[dict]]) -> list[dict]:
                 ):
                     if raw.get(k) is not None and out.get(k) is None:
                         out[k] = raw[k]
+                filled_ownership_pct = (
+                    not prev_had_ownership_pct and raw.get("ownership_pct") is not None
+                )
+                if filled_ownership_pct and src:
+                    # ownership_pct came from a non-13F source (e.g. 13G) merged
+                    # onto a 13F-primary row — the note must not pretend it came
+                    # from 13F alone (P5: provenance stamps travel with the value).
+                    note = str(out.get("note") or "")
+                    stamp = str(raw.get("note") or f"ownership_pct_source={src}")
+                    if stamp not in note:
+                        out["note"] = f"{note}; {stamp}".strip("; ") if note else stamp
                 # Investments-table disclosed FV fills null 13G dollars (not narrative cost)
                 filled_disclosed_mv = False
                 if out.get("market_value_usd") is None:
