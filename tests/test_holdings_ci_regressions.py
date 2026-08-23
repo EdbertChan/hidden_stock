@@ -199,6 +199,14 @@ def test_ci_merge_13f_wins_dollars_13g_fills_ownership_notes_fill_didi_fv():
     grab = next(r for r in merged if r["investee_ticker"] == "GRAB")
     assert grab["market_value_usd"] == 2e9
     assert grab.get("ownership_pct") == 13.5
+    # ownership_pct_provenance_not_preserved (real BABA grade finding, 2026-08-22):
+    # this is the REAL production merge path (build_holdings_history calls
+    # _merge_period_rows, not merge_raw_holdings) — GRAB is 13F-primary and
+    # gets ownership_pct filled from the 13G group via _fill_missing; the note
+    # must not claim the % came from 13F alone.
+    assert "13g" in str(grab.get("note") or "").lower()
+    aur = next(r for r in merged if r["investee_ticker"] == "AUR")
+    assert "13g" in str(aur.get("note") or "").lower()
     didi = next(r for r in merged if r["investee_ticker"] == "DIDIY")
     assert didi["market_value_usd"] == 1_900_000_000.0
     assert "investments_table" in str(didi.get("note") or "")
