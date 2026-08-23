@@ -20,7 +20,7 @@ from hidden_stock.quirks.holdings.history import (
 )
 from hidden_stock.quirks.holdings.parse_notes import parse_investment_notes, parse_investments_table
 from hidden_stock.quirks.holdings.parents import history_strategy, normalize_parent, uses_hk_aggregates
-from hidden_stock.quirks.holdings.runner import merge_raw_holdings
+from hidden_stock.quirks.holdings.runner import _finalize_rows, merge_raw_holdings
 from hidden_stock.quirks.holdings.sec_13g import is_self_issuer, parse_13g_html, raw_to_position
 
 
@@ -191,6 +191,14 @@ def test_ci_merge_13f_wins_dollars_13g_fills_ownership_notes_fill_didi_fv():
     assert by["AUR"].get("ownership_pct") == 10.9
     assert by["DIDIY"]["market_value_usd"] == 1_900_000_000.0
     assert sum(1 for r in live if r.get("investee_ticker") == "AUR") == 1
+    # ownership_pct_provenance_not_preserved (real BABA grade finding, 2026-08-22):
+    # GRAB/AUR are 13F-primary rows whose ownership_pct is filled in from a
+    # separate 13G row — the finalized note must not claim the % came from
+    # 13F alone. Checked post-_finalize_rows: that's what actually gets
+    # exported/graded.
+    finalized = {r["investee_ticker"]: r for r in _finalize_rows(live)}
+    assert "13g" in str(finalized["GRAB"].get("note") or "").lower()
+    assert "13g" in str(finalized["AUR"].get("note") or "").lower()
 
     merged = _merge_period_rows(f13, g13, notes)
     tickers = [r["investee_ticker"] for r in merged]

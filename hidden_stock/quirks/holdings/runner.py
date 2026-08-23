@@ -112,6 +112,7 @@ def merge_raw_holdings(parts: list[list[dict]]) -> list[dict]:
                     ticker_key[t] = key
                 continue
             out = dict(prev)
+            prev_had_ownership_pct = prev.get("ownership_pct") is not None
             for k, v in raw.items():
                 if v is None:
                     continue
@@ -146,6 +147,12 @@ def merge_raw_holdings(parts: list[list[dict]]) -> list[dict]:
                 ):
                     if raw.get(k) is not None and out.get(k) is None:
                         out[k] = raw[k]
+                if not prev_had_ownership_pct and raw.get("ownership_pct") is not None and src:
+                    # ownership_pct came from a non-13F source merged onto a
+                    # 13F-primary row — track its real provenance internally;
+                    # _finalize_rows folds this into the public `note` field
+                    # (P5: provenance stamps travel with the value).
+                    out["_ownership_pct_note"] = str(raw.get("note") or f"ownership_pct_source={src}")
                 # Investments-table disclosed FV fills null 13G dollars (not narrative cost)
                 filled_disclosed_mv = False
                 if out.get("market_value_usd") is None:
@@ -201,6 +208,10 @@ def _finalize_rows(raw_rows: list[dict], *, skip_eodhd_for_13f: bool = True) -> 
                 "filing_gaap_hint",
             }:
                 base[k] = v
+        ownership_pct_note = raw.get("_ownership_pct_note")
+        if ownership_pct_note and ownership_pct_note not in str(base.get("note") or ""):
+            note = str(base.get("note") or "")
+            base["note"] = f"{note}; {ownership_pct_note}".strip("; ") if note else ownership_pct_note
         if base.get("market_value_usd") is None:
             _apply_disclosed_fv(base)
         elif not _is_13f_source(str(raw.get("_source") or "")) and not _source_allows_chart_dollars(
