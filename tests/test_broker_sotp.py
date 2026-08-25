@@ -35,14 +35,24 @@ FIXTURE_2023 = (
 
 
 def test_catalog_series_backfills_multiple_vintages():
-    entries = load_catalog()
-    tcehy = [e for e in entries if e.get("parent_ticker") == "TCEHY"]
-    assert len(tcehy) >= 5
-    series_ids = {e["series_id"] for e in tcehy}
-    assert series_ids == {"cmbigm_tencent_strategic"}
-    as_ofs = sorted(e["as_of"] for e in tcehy)
-    assert as_ofs[0] <= "2023-03-21"
-    assert as_ofs[-1] >= "2025-08-12"
+    """Example catalog documents multi-vintage series; production catalog is empty."""
+    import yaml
+
+    example = (
+        Path(__file__).resolve().parents[1]
+        / "hidden_stock"
+        / "quirks"
+        / "holdings"
+        / "data"
+        / "broker_sotp_catalog.example.yaml"
+    )
+    raw = yaml.safe_load(example.read_text(encoding="utf-8"))
+    series = raw.get("series") or []
+    assert series
+    assert series[0].get("parent_ticker") == "EXAMPLE"
+    assert len(series[0].get("reports") or []) >= 1
+    # Shipped production catalog must not embed live broker research URLs.
+    assert load_catalog() == []
 
 
 def test_parse_cmbigm_meituan_stake_1_7():

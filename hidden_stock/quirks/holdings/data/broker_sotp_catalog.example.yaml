@@ -1,0 +1,20 @@
+# Example broker SOTP catalog (not loaded by default).
+# Copy entries into broker_sotp_catalog.yaml after you have licensed PDFs.
+#
+# Parser: cmbigm_strategic_investments expects a "valuation of strategic
+# investments" table with Name / Ticker / stake / mkt cap / value-to-parent.
+
+series:
+  - id: example_parent_strategic
+    parent_ticker: EXAMPLE
+    broker: EXAMPLE_BROKER
+    parser: cmbigm_strategic_investments
+    table_marker: "valuation of strategic investments"
+    citation_template: "EXAMPLE_BROKER; company data; market close {as_of}"
+    enabled: false
+    reports:
+      - id: example_parent_2025-01-15
+        as_of: "2025-01-15"
+        published: "2025-01-16"
+        url: "https://example.com/replace-with-licensed-pdf.pdf"
+        enabled: false

@@ -26,6 +26,12 @@ exports/
 *.csv
 !tests/**/*.csv
 backtest_report_data.json
+*.pdf
+!tests/**/*.pdf
+
+# Cached filings / broker research (never commit)
+**/hk_annual_cache/
+**/broker_pdfs/
 
 # OS / editor
 .DS_Store
