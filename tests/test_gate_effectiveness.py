@@ -950,3 +950,31 @@ def test_gate_fires_and_stays_silent(case: Defect, clean, grade, reconcile_cli, 
     case.fires(ctx)
 
 
+_CHECK_ID_RE = re.compile(r'checks(?:\[\s*|\.setdefault\(\s*)"([a-z0-9_]+)"')
+
+
+def registered_precheck_ids(grade_src: str, clean_checks: dict) -> set[str]:
+    return set(_CHECK_ID_RE.findall(grade_src)) | set(clean_checks)
+
+
+def exported_assert_functions() -> set[str]:
+    out: set[str] = set()
+    for mod in (perf_mod, history_mod):
+        out |= {n for n, obj in vars(mod).items() if n.startswith("assert_") and inspect.isfunction(obj)}
+    return out
+
+
+def test_every_gate_has_an_effectiveness_test(clean: Scenario):
+    src = (_ROOT / "scripts" / "grade_holdings_sheet.py").read_text(encoding="utf-8")
+    required = registered_precheck_ids(src, clean.mech["checks"]) | exported_assert_functions()
+    covered = {g for d in DEFECTS for g in d.gates}
+    ids = [d.id for d in DEFECTS]
+    assert len(ids) == len(set(ids))
+    missing = sorted(required - covered)
+    assert not missing, (
+        "gates with no effectiveness test in tests/test_gate_effectiveness.py "
+        f"(add a Defect naming each): {missing}"
+    )
+    assert {"sell_without_realized_row", "period_grid_gap", "dietz_sane", "unreconciled_rows"} <= required
+    assert {"assert_sell_realized_coverage", "assert_note_dates_in_period_grid",
+            "assert_unique_period_ticker", "assert_mtm_identity"} <= required
