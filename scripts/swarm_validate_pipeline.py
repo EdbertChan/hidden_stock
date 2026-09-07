@@ -10,7 +10,8 @@ composition→composition_export.
 Writes exports/<ticker>_swarm_<stage>_{mechanical,fable,codex,board}.json
 and exports/<ticker>_swarm_<stage>_board.md.
 
-Mechanical FAIL hard on the board. LLM judges still run for recommended_fixes.
+Mechanical FAIL hard on the board. LLM judges run only with --judge-mode full
+(once per export content hash; --force to re-judge) for recommended_fixes.
 On BOARD FAIL / NEEDS_WORK follow thrash-reflect-automate (same as sheet swarm).
 """
 
@@ -57,6 +58,11 @@ def main() -> int:
         validate_stage,
         write_stage_board_md,
     )
+    from hidden_stock.quirks.holdings.judge_digest import (
+        export_content_hash,
+        full_judge_skip_reason,
+        record_last_judged,
+    )
 
     load_dotenv(_ROOT)
     p = argparse.ArgumentParser(description=__doc__)
@@ -73,6 +79,20 @@ def main() -> int:
     )
     p.add_argument("--exports-dir", default=str(_ROOT / "exports"))
     p.add_argument("--out-dir", default=None, help="Default: same as exports-dir")
+    p.add_argument(
+        "--judge-mode",
+        choices=("mechanical", "full"),
+        default="mechanical",
+        help=(
+            "mechanical (default): no LLM judges. full: run LLM judges once per "
+            "export content hash (see <slug>_swarm_last_judged.json)."
+        ),
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run LLM judges in full mode even if this export hash was judged",
+    )
     args = p.parse_args()
 
     parent = normalize_parent(args.parent)
@@ -90,6 +110,21 @@ def main() -> int:
         stages.append(STAGE_ALIASES[key])
 
     judges = [j.strip().lower() for j in args.judges.split(",") if j.strip()]
+    llm_judges = [j for j in judges if j in {"fable", "codex"}]
+    content_hash = export_content_hash(exports_dir, parent.lower())
+    skip_reason = full_judge_skip_reason(
+        out_dir,
+        parent.lower(),
+        judge_mode=args.judge_mode,
+        force=args.force,
+        scope="swarm",
+        content_hash=content_hash,
+    )
+    if skip_reason and llm_judges:
+        print(f"LLM judges skipped: {skip_reason}", file=sys.stderr)
+        if args.judge_mode == "full":
+            return 3
+        judges = [j for j in judges if j not in {"fable", "codex"}]
     schema_path = (
         PIPELINE_SCHEMA_PATH if PIPELINE_SCHEMA_PATH.is_file() else DEFAULT_SCHEMA_PATH
     )
@@ -166,6 +201,14 @@ def main() -> int:
     }
     summary_path = out_dir / f"{slug}_swarm_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    if any(j in {"fable", "codex"} for j in judges):
+        record_last_judged(
+            out_dir,
+            slug,
+            content_hash=content_hash,
+            judges=[j for j in judges if j in {"fable", "codex"}],
+            scope="swarm",
+        )
     print(f"\nSummary: ok={overall_ok} → {summary_path}", file=sys.stderr)
     # Exit 1 on FAIL so CI/gates can hard-fail mechanical+board (not Celery yet).
     return 0 if overall_ok else 1
