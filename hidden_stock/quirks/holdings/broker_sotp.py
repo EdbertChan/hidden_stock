@@ -341,20 +341,24 @@ def parse_cmbigm_strategic_investments(text: str) -> list[dict[str, Any]]:
             if parsed:
                 rows.append(parsed)
 
+    rows = [r for r in rows if _plausible_stake_row(r)]
     if len(rows) >= 3:
         return rows
 
-    # Fallback: scan whole document for inline stake×mcap tuples.
+    # Fallback: inline stake×mcap tuples, but only inside the named figure.
+    # A whole-document scan matched peer-comp tables (Name | Ticker | Price |
+    # Mkt cap | P/E …) in a CMBI strategy PDF as "stakes" of 612% / 157%.
     blob = re.sub(r"\s+", " ", text or "")
-    # Prefer window around the figure if present.
     low = blob.lower()
     idx = low.find("valuation of strategic investments")
-    window = blob[idx : idx + 8000] if idx >= 0 else blob
+    if idx < 0:
+        return rows
+    window = blob[idx : idx + 8000]
     seen: set[str] = set()
     inline: list[dict[str, Any]] = []
     for m in _CMBIGM_INLINE.finditer(window):
         parsed = _row_from_match(m)
-        if not parsed:
+        if not parsed or not _plausible_stake_row(parsed):
             continue
         key = parsed["investee_ticker"]
         if key in seen:
@@ -362,6 +366,17 @@ def parse_cmbigm_strategic_investments(text: str) -> list[dict[str, Any]]:
         seen.add(key)
         inline.append(parsed)
     return inline if len(inline) > len(rows) else rows
+
+
+def _plausible_stake_row(r: dict[str, Any]) -> bool:
+    """A strategic-stake row is 0 < stake% <= 100 with positive mcap and value."""
+    try:
+        stake = float(r.get("ownership_pct"))
+        mcap = float(r.get("mkt_cap_usd_mn"))
+        value = float(r.get("value_to_parent_hkd_mn"))
+    except (TypeError, ValueError):
+        return False
+    return 0.0 < stake <= 100.0 and mcap > 0.0 and value > 0.0
 
 
 _PARSERS = {

@@ -340,3 +340,29 @@ def test_write_csvs_has_no_broker_sotp_paths(tmp_path):
     assert "realized_chart" not in paths
     assert "realized_by_ticker_chart" not in paths
     assert "returns_by_period" in paths
+
+
+# Peer-comp table shape from a CMBI Chinese-language strategy PDF (no
+# "valuation of strategic investments" figure). Columns are price / mkt cap /
+# P/E, not stake / mcap / value — the parser must return nothing, not 21 rows
+# with a 612% "stake" in Tencent itself.
+COMP_TABLE_NOT_STAKES = """
+Internet sector valuation
+Tencent 700 HK 612.0 713,178 19.0 17.2 4.1 3.7 3.5 12%
+Alibaba BABA US 157.4 375,664 24.0 20.1 2.3 2.1 1.8 6%
+Kuaishou 1024 HK 67.5 37,591 12.9 11.5 1.9 1.7 0.8 15%
+Baidu BIDU US 118.7 41,623 15.0 13.9 0.9 0.9 1.1 -3%
+NetEase NTES US 139.7 88,483 15.0 14.1 3.2 2.9 4.1 9%
+Pinduoduo PDD US 116.8 165,843 10.6 9.0 2.7 2.4 2.6 4%
+Source: Bloomberg, CMBIGM estimates
+"""
+
+
+def test_parser_rejects_peer_comp_table_without_strategic_figure():
+    assert parse_cmbigm_strategic_investments(COMP_TABLE_NOT_STAKES) == []
+
+
+def test_parser_still_reads_real_figure_after_guard():
+    rows = parse_cmbigm_strategic_investments(FIXTURE.read_text(encoding="utf-8"))
+    assert len(rows) >= 3
+    assert all(0 < r["ownership_pct"] <= 100 for r in rows)
