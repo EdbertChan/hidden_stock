@@ -105,10 +105,13 @@ def mechanical_precheck(
     portfolio_csv: Path,
     *,
     parent: str,
+    parent_name_hints: list[str] | None = None,
 ) -> dict:
     """Pandas checks that must not wait for an LLM judge (SERV-class bugs).
 
     Parent-scoped: Uber 10-Q DIDIY/GRAB/AUR anchors apply **only** when parent is UBER.
+    ``parent_name_hints`` (EDGAR current + former names) feeds the self-issuer
+    check; when omitted it uses whatever an export already cached.
     """
     parent_u = str(parent or "").strip().upper()
     issues: list[dict] = []
@@ -547,6 +550,42 @@ def mechanical_precheck(
             checks["no_blank_public_ticker"] = "fail"
         else:
             checks["no_blank_public_ticker"] = "pass"
+
+    checks.setdefault("no_self_issuer_row", "unknown")
+    if "investee_ticker" in hist.columns or "investee_name" in hist.columns:
+        from hidden_stock.quirks.holdings.validate import self_issuer_row_reason
+
+        hints = list(parent_name_hints or [])
+        if not hints:
+            from hidden_stock.quirks.holdings.sec_13g import known_parent_name_hints
+
+            hints = known_parent_name_hints(parent_u)
+        self_rows = []
+        for r in hist.to_dict(orient="records"):
+            reason = self_issuer_row_reason(r, parent_u, hints)
+            if reason:
+                self_rows.append(
+                    {
+                        "period_end": r.get("period_end"),
+                        "investee_ticker": r.get("investee_ticker"),
+                        "investee_name": r.get("investee_name"),
+                        "reason": reason,
+                    }
+                )
+        if self_rows:
+            issues.append(
+                {
+                    "id": "self_issuer_row",
+                    "severity": (
+                        "history row is the parent holding itself: third-party 13D/G "
+                        "about the parent under its own CIK (PDD/Pinduoduo class)"
+                    ),
+                    "evidence": self_rows[:8],
+                }
+            )
+            checks["no_self_issuer_row"] = "fail"
+        else:
+            checks["no_self_issuer_row"] = "pass"
 
     checks.setdefault("unreconciled_rows", "unknown")
     reconcile_csv = history_csv.parent / f"{parent_u.lower().replace('-', '')}_reconcile.csv"

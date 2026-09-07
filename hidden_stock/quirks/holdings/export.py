@@ -95,9 +95,18 @@ def engine_from_env() -> Engine:
 
 def refresh_current(parent: str, edgar: Any, *, engine: Engine | None = None) -> pd.DataFrame:
     """Refresh live holdings for one parent into Postgres (full-table replace for that run)."""
+    from .sec_13g import known_parent_name_hints
+    from .validate import assert_no_self_issuer_rows
+
     eng = engine or engine_from_env()
     rows, meta = process_parent_holdings(
         parent_ticker=parent, edgar=edgar, llm=None, use_llm_fallback=False
+    )
+    assert_no_self_issuer_rows(
+        rows,
+        parent,
+        parent_name_hints=known_parent_name_hints(parent),
+        context="refresh_current before postgres",
     )
     hold = pd.DataFrame(rows, columns=HOLDINGS_COLUMNS) if rows else pd.DataFrame(columns=HOLDINGS_COLUMNS)
     roll = rollup_holdings(rows)
@@ -139,13 +148,26 @@ def refresh_history(
     max_filings: int = 80,
     lookback_years: int = 5,
     engine: Engine | None = None,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Rebuild QoQ history into Postgres; returns ``(history, build meta)``.
+
+    Refuses to write when any row is the parent holding itself (PDD class).
+    """
+    from .sec_13g import known_parent_name_hints
+    from .validate import assert_no_self_issuer_rows
+
     eng = engine or engine_from_env()
-    rows, _meta = build_holdings_history(
+    rows, meta = build_holdings_history(
         parent_ticker=parent,
         edgar=edgar,
         max_filings=max_filings,
         lookback_years=lookback_years,
+    )
+    assert_no_self_issuer_rows(
+        rows,
+        parent,
+        parent_name_hints=known_parent_name_hints(parent),
+        context="refresh_history before postgres",
     )
     hist = pd.DataFrame(rows, columns=HISTORY_COLUMNS) if rows else pd.DataFrame(columns=HISTORY_COLUMNS)
     try:
@@ -155,7 +177,7 @@ def refresh_history(
     except Exception:
         out = hist
     out.to_sql("equity_holdings_history", eng, schema="stock_data", if_exists="replace", index=False)
-    return hist
+    return hist, meta
 
 
 def load_current(parent: str, engine: Engine | None = None) -> pd.DataFrame:
@@ -515,14 +537,25 @@ def write_csvs(
     lookback_start: str | None = None,
 ) -> dict[str, Path]:
     from .history import assert_unique_period_ticker
+    from .sec_13g import known_parent_name_hints
     from .validate import (
         assert_estimates_not_in_market_value,
         assert_live_shares_held_sane,
+        assert_no_self_issuer_rows,
         scrub_live_pct_as_shares,
     )
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    parent_names = known_parent_name_hints(parent)
+    for label, frame in (("history", hist), ("current", hold)):
+        if frame is not None and len(frame):
+            assert_no_self_issuer_rows(
+                frame.to_dict(orient="records"),
+                parent,
+                parent_name_hints=parent_names,
+                context=f"export/{parent}/{label}",
+            )
     # Refuse to ship Sheets/CSV when QoQ history doubles a ticker in one period
     # (SERV exit+13G miss after AUR-only CI).
     if hist is not None and len(hist):
@@ -1245,8 +1278,9 @@ def export_parent(
     from .lookback import lookback_start_date
 
     lookback_start = lookback_start_date(lookback_years=lookback_years)
+    build_meta: dict[str, Any] = {}
     if history:
-        hist = refresh_history(
+        hist, build_meta = refresh_history(
             parent,
             edgar,
             max_filings=max_filings,

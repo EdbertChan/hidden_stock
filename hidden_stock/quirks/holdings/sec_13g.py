@@ -396,6 +396,18 @@ def parent_name_hints_for(
     return list(names)
 
 
+def known_parent_name_hints(parent_ticker: str) -> list[str]:
+    """Names already resolved for a parent: in-process cache, then the on-disk
+    EDGAR cache written by an earlier export. Never fetches; ``[]`` otherwise.
+    Used by export/grade paths that have no EDGAR client in hand."""
+    hints = parent_name_hints_for(parent_ticker)
+    if hints:
+        return hints
+    from hidden_stock.resources.edgar_resource import cached_company_names_for_ticker
+
+    return cached_company_names_for_ticker(parent_ticker)
+
+
 def is_self_issuer(
     parsed: dict,
     *,

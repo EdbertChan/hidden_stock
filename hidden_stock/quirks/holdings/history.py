@@ -1041,6 +1041,17 @@ def build_13f_history(
     return history, meta
 
 
+def _without_self_issuer_rows(
+    history: list[dict], parent: str, hints: list[str], meta: dict[str, Any]
+) -> list[dict]:
+    """Defense in depth after the collectors: no row may be the parent itself."""
+    from .validate import drop_self_issuer_rows
+
+    kept, dropped = drop_self_issuer_rows(history, parent, parent_name_hints=hints)
+    meta["num_self_issuer_dropped"] = len(dropped)
+    return kept
+
+
 def build_holdings_history(
     *,
     parent_ticker: str,
@@ -1086,6 +1097,7 @@ def build_holdings_history(
         meta["strategy"] = strategy
         meta["lookback_start"] = start
         meta["lookback_years"] = lookback_years
+        hist = _without_self_issuer_rows(hist, parent, hints, meta)
         return stamp_filing_urls(price_history_rows(hist), cik=cik), meta
 
     ordered, meta = _collect_13f_periods(
@@ -1159,7 +1171,7 @@ def build_holdings_history(
             )
             meta["grid"] = "13g"
             meta["num_periods"] = len(g13_snaps)
-            return history, meta
+            return _without_self_issuer_rows(history, parent, hints, meta), meta
         meta["error"] = meta.get("error") or "no 13F or 13G periods"
         return [], meta
 
@@ -1220,6 +1232,7 @@ def build_holdings_history(
     history = stamp_filing_urls(price_history_rows(diff_snapshots(parent, enriched)), cik=cik)
     if truncated:
         history = stamp_truncated_notes(history, truncated)
+    history = _without_self_issuer_rows(history, parent, hints, meta)
     meta["grid"] = "13f"
     meta["num_note_history_rows"] = sum(
         1

@@ -333,7 +333,12 @@ def process_parent_holdings(
     meta["num_notes"] = len(raw_notes)
     meta["notes_filings_scanned"] = len(annuals)
 
-    merged = merge_raw_holdings([raw_13f, raw_13g, raw_notes])
+    from .validate import drop_self_issuer_rows
+
+    merged, self_rows = drop_self_issuer_rows(
+        merge_raw_holdings([raw_13f, raw_13g, raw_notes]), parent, parent_name_hints=hints
+    )
+    meta["num_self_issuer_dropped"] = len(self_rows)
     meta["num_raw"] = len(merged)
 
     if use_llm_fallback and not merged and filing and llm is not None:

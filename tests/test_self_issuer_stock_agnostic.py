@@ -249,3 +249,40 @@ def test_parent_name_hints_for_logs_and_returns_empty_on_edgar_error(caplog):
         assert parent_name_hints_for("XYZ", edgar=Broken()) == []
     assert "edgar down" in caplog.text and "XYZ" in caplog.text
     sec_13g.clear_parent_name_hints()
+
+
+def test_validate_self_issuer_rows_fire_and_stay_silent():
+    from hidden_stock.quirks.holdings.validate import (
+        assert_no_self_issuer_rows,
+        drop_self_issuer_rows,
+        self_issuer_row_reason,
+    )
+
+    pdd_self = {"period_end": "2018-09-30", "investee_ticker": "PDD", "investee_name": "Pinduoduo Inc."}
+    pdd_former = {"period_end": "2019-03-31", "investee_ticker": None, "investee_name": "Pinduoduo Inc."}
+    real = {"period_end": "2024-12-31", "investee_ticker": "GRAB", "investee_name": "Grab Holdings Ltd"}
+    assert self_issuer_row_reason(pdd_self, "PDD") == "investee_ticker=PDD is the parent"
+    assert self_issuer_row_reason(pdd_former, "PDD") is None
+    assert self_issuer_row_reason(pdd_former, "PDD", PDD_NAMES) == "investee_name='Pinduoduo Inc.' is a parent name"
+    assert self_issuer_row_reason(real, "UBER", UBER_NAMES) is None
+    kept, dropped = drop_self_issuer_rows([pdd_self, pdd_former, real], "PDD", parent_name_hints=PDD_NAMES)
+    assert kept == [real] and dropped == [pdd_self, pdd_former]
+    assert assert_no_self_issuer_rows([real], "PDD", parent_name_hints=PDD_NAMES) is None
+    with pytest.raises(AssertionError, match=r"self_issuer rows for PDD \(hist\).*2018-09-30.*2019-03-31"):
+        assert_no_self_issuer_rows([pdd_self, pdd_former, real], "PDD", parent_name_hints=PDD_NAMES, context="hist")
+
+
+def test_known_parent_name_hints_falls_back_to_disk_cache(tmp_path, monkeypatch):
+    from hidden_stock.quirks.holdings.sec_13g import known_parent_name_hints
+
+    monkeypatch.setattr(edgar_resource, "COMPANY_NAMES_CACHE_DIR", tmp_path)
+    edgar_resource._COMPANY_NAMES_CACHE.clear()
+    sec_13g.clear_parent_name_hints()
+    assert known_parent_name_hints("PDD") == []
+    (tmp_path / "CIK0001737806.json").write_text(
+        json.dumps({"cik": "0001737806", "names": PDD_NAMES, "tickers": ["PDD"]}), encoding="utf-8"
+    )
+    assert known_parent_name_hints("PDD") == PDD_NAMES
+    assert known_parent_name_hints("UBER") == []
+    edgar_resource._COMPANY_NAMES_CACHE.clear()
+    sec_13g.clear_parent_name_hints()
