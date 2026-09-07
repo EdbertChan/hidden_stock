@@ -56,3 +56,10 @@ def test_skill_how_you_check_covers_sheet_and_one_aur():
 def test_skill_null_is_ok_until_filing_fv():
     text = _skill()
     assert re.search(r"(?i)null.*(?:OK|ok|omit)|leave.*null", text)
+
+
+def test_skill_names_rule_edit_gate():
+    text = _skill()
+    assert "check_skill_edit_has_code.py" in text
+    assert re.search(r"(?i)rule needs code", text)
+    assert re.search(r"\[doc-only\]", text)

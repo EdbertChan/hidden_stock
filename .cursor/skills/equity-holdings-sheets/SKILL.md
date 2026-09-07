@@ -91,6 +91,7 @@ Canonical copy: `.cursor/skills/principle-assert-invariants-not-last-bug/SKILL.m
 6. **No silent escape hatches** — do not add “continuity” invent paths that look rubric-OK.
 7. **Lookback ≠ inception** — windowed chart; sparse walkback for edge-held lots.
 8. **ADS ratio ≠ disposal** — integer share consol + issuer CUSIP change ⇒ `ratio_adj`, scale lots, no realized.
+9. **A rule needs code** — any new/changed principle line here or in `.cursor/rules/*.mdc` must land with a test or code hunk in the same commit. `scripts/check_skill_edit_has_code.py` enforces it (pre-commit via `.githooks`, and CI over the PR range); a doc-only rule is drift (5ab00d0 shipped the "same commit" rule with no code). Bypass only explicitly with a `[doc-only]` tag or `--allow-doc-only`; it is logged.
 
 ## Rules
 
