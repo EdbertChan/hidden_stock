@@ -57,24 +57,41 @@ class EdgarResource(dg.ConfigurableResource):
         session = self._session()
         resp = session.get(f"https://data.sec.gov/submissions/CIK{cik}.json", timeout=15)
         resp.raise_for_status()
-        recent = resp.json()["filings"]["recent"]
+        payload = resp.json()["filings"]
         as_of_ts = pd.Timestamp(as_of) if as_of else None
         out: list[dict] = []
-        for i, form in enumerate(recent["form"]):
-            if form not in form_types:
+
+        def _scan(block: dict) -> bool:
+            for i, form in enumerate(block["form"]):
+                if form not in form_types:
+                    continue
+                filing_date = block["filingDate"][i]
+                if as_of_ts is not None and pd.Timestamp(filing_date) > as_of_ts:
+                    continue
+                out.append(
+                    {
+                        "accession_no": block["accessionNumber"][i],
+                        "filing_date": filing_date,
+                        "primary_document": block["primaryDocument"][i],
+                        "form": form,
+                    }
+                )
+                if len(out) >= limit:
+                    return True
+            return False
+
+        if _scan(payload["recent"]):
+            return out
+        # The submissions API pages older filings into sibling files (UBER's
+        # ``recent`` starts 2020-08). Only fetch them when the caller asked for
+        # more than ``recent`` holds — default limits never reach here.
+        for older in payload.get("files") or []:
+            name = older.get("name")
+            if not name:
                 continue
-            filing_date = recent["filingDate"][i]
-            if as_of_ts is not None and pd.Timestamp(filing_date) > as_of_ts:
-                continue
-            out.append(
-                {
-                    "accession_no": recent["accessionNumber"][i],
-                    "filing_date": filing_date,
-                    "primary_document": recent["primaryDocument"][i],
-                    "form": form,
-                }
-            )
-            if len(out) >= limit:
+            r2 = session.get(f"https://data.sec.gov/submissions/{name}", timeout=15)
+            r2.raise_for_status()
+            if _scan(r2.json()):
                 break
         return out
 

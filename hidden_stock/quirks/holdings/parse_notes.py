@@ -55,13 +55,41 @@ _AS_OF_DATES_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Two-column table row: each cell is a number or an em/en dash (nil). A number
+# token must end at a non-digit so "2,838 —" cannot backtrack into "2,83" + "8".
+_NUM_OR_DASH = r"(?:[\d,]+(?:\.\d+)?(?![\d,])|[—–-])"
 _INVESTMENTS_ROW_RE = re.compile(
     r"(?P<name>Didi|Grab|Aurora|Delivery\s+Hero|Recursion)"
     r"(?:\s*\([^)]*\))?"
-    r"\s*\$?\s*(?P<a>[\d,]+(?:\.\d+)?)"
-    r"\s*\$?\s*(?P<b>[\d,]+(?:\.\d+)?)",
+    r"\s*\$?\s*(?P<a>" + _NUM_OR_DASH + r")"
+    r"\s*\$?\s*(?P<b>" + _NUM_OR_DASH + r")",
     re.IGNORECASE,
 )
+
+# 10-K style header: "As of December 31, 2024 2025" (one month/day, two years).
+_AS_OF_YEAR_PAIR_RE = re.compile(
+    r"As\s+of\s+(?P<m>January|February|March|April|May|June|July|August|"
+    r"September|October|November|December)\s+(?P<d>\d{1,2}),\s+(?P<y1>\d{4})"
+    r"\s+(?:and\s+)?(?P<y2>\d{4})\b",
+    re.IGNORECASE,
+)
+
+
+def find_as_of_dates(plain: str) -> tuple[str, str] | None:
+    """Two column dates from an Investments-table header (10-Q or 10-K form)."""
+    dm = _AS_OF_DATES_RE.search(plain)
+    if dm:
+        return (
+            _parse_mdy_date(dm.group("m1"), dm.group("d1"), dm.group("y1")),
+            _parse_mdy_date(dm.group("m2"), dm.group("d2"), dm.group("y2")),
+        )
+    ym = _AS_OF_YEAR_PAIR_RE.search(plain)
+    if ym:
+        return (
+            _parse_mdy_date(ym.group("m"), ym.group("d"), ym.group("y1")),
+            _parse_mdy_date(ym.group("m"), ym.group("d"), ym.group("y2")),
+        )
+    return None
 
 
 def strip_xbrl_member_soup(text: str) -> str:
@@ -149,8 +177,11 @@ def _parse_mdy_date(month: str, day: str, year: str) -> str:
 
 
 def _millions_to_usd(raw: str) -> float | None:
+    """``"2,838"`` → 2.838e9; a dash cell (``—``) is nil → None."""
+    if raw is None or str(raw).strip() in {"—", "–", "-", ""}:
+        return None
     try:
-        return float(raw.replace(",", "")) * 1_000_000.0
+        return float(str(raw).replace(",", "")) * 1_000_000.0
     except (TypeError, ValueError):
         return None
 
@@ -235,24 +266,29 @@ def parse_investments_table(
             # Still accept if Didi/Grab/Aurora rows + As of dates appear
             if not re.search(r"\b(Didi|Grab|Aurora)\b", table_plain, re.IGNORECASE):
                 continue
-        dm = _AS_OF_DATES_RE.search(table_plain)
-        if not dm:
+        dates = find_as_of_dates(table_plain)
+        if not dates:
             continue
-        date_a = _parse_mdy_date(dm.group("m1"), dm.group("d1"), dm.group("y1"))
-        date_b = _parse_mdy_date(dm.group("m2"), dm.group("d2"), dm.group("y2"))
+        date_a, date_b = dates
+        # One investee can appear on two lines of the same table (e.g. Didi
+        # under Non-marketable and Marketable after its 2022 delisting): sum
+        # the numeric cells per column; dash cells add nothing.
+        sums: dict[str, list] = {}
         for tr in re.finditer(r"<tr\b[^>]*>(.*?)</tr>", table_html, re.IGNORECASE | re.DOTALL):
             plain = _html_row_plain(tr.group(1))
             rm = _INVESTMENTS_ROW_RE.search(plain)
             if not rm:
                 continue
-            add_pair(
-                rm.group("name"),
-                date_a,
-                _millions_to_usd(rm.group("a")),
-                date_b,
-                _millions_to_usd(rm.group("b")),
-                plain,
-            )
+            name = rm.group("name")
+            usd_a = _millions_to_usd(rm.group("a"))
+            usd_b = _millions_to_usd(rm.group("b"))
+            acc = sums.setdefault(name.strip().lower(), [name, None, None, plain])
+            if usd_a is not None:
+                acc[1] = (acc[1] or 0.0) + usd_a
+            if usd_b is not None:
+                acc[2] = (acc[2] or 0.0) + usd_b
+        for name, usd_a, usd_b, quote in sums.values():
+            add_pair(name, date_a, usd_a, date_b, usd_b, quote)
 
     if rows_out:
         return rows_out
@@ -261,11 +297,10 @@ def parse_investments_table(
     prose = strip_xbrl_member_soup(text)
     prose = html_lib.unescape(re.sub(r"<[^>]+>", " ", prose))
     prose = re.sub(r"\s+", " ", prose)
-    dm = _AS_OF_DATES_RE.search(prose)
+    dm = _AS_OF_DATES_RE.search(prose) or _AS_OF_YEAR_PAIR_RE.search(prose)
     if not dm:
         return []
-    date_a = _parse_mdy_date(dm.group("m1"), dm.group("d1"), dm.group("y1"))
-    date_b = _parse_mdy_date(dm.group("m2"), dm.group("d2"), dm.group("y2"))
+    date_a, date_b = find_as_of_dates(prose[dm.start() : dm.end()])  # type: ignore[misc]
     # Restrict search window after the As-of header
     window = prose[dm.start() : dm.start() + 4000]
     for rm in _INVESTMENTS_ROW_RE.finditer(window):

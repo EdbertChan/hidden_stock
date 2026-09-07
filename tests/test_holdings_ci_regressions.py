@@ -407,7 +407,13 @@ def test_ci_build_holdings_history_fans_out_table_fv_not_eodhd():
     by = {r["investee_ticker"]: r for r in hist}
     assert by["DIDIY"]["market_value_usd"] == 1_900_000_000.0
     assert by["AUR"]["market_value_usd"] == 1_763_000_000.0
-    assert sum(1 for r in hist if r.get("investee_ticker") == "AUR") == 1
+    # 13F + 13G collide on ticker: one AUR row per period (the 10-Q's prior
+    # 2025-12-31 column also forms a pre-13F period, so count per period_end).
+    from collections import Counter
+
+    per_period = Counter((r["period_end"], r["investee_ticker"]) for r in hist)
+    assert per_period[("2026-06-30", "AUR")] == 1
+    assert max(per_period.values()) == 1
 
 
 def test_ci_enrich_mtm_never_invents_shares_times_price():

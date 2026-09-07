@@ -320,7 +320,45 @@ def test_performance_frames_empty():
     assert "reported_vs_est" in frames
 
 
-def test_reported_yaml_loads_baba_empty_unknown():
+# The curated BABA income YAML was removed from the public repo (400c6ed);
+# tests write a fixture with the same shape so the loader/recon logic stays
+# covered without shipping stock-specific data.
+BABA_INCOME_YAML = """
+parent: BABA
+line_item: Interest and investment income, net
+source_url: https://www.sec.gov/Archives/edgar/data/1577552/000119312526231755/R66.htm
+periods:
+  - period_label: FY2024
+    fiscal_year_end: "2024-03-31"
+    calendar_start: "2023-06-30"
+    calendar_end: "2024-03-31"
+    amount_rmb_million: -9964
+    amount_usd_million: null
+  - period_label: FY2025
+    fiscal_year_end: "2025-03-31"
+    calendar_start: "2024-06-30"
+    calendar_end: "2025-03-31"
+    amount_rmb_million: 20759
+    amount_usd_million: null
+  - period_label: FY2026
+    fiscal_year_end: "2026-03-31"
+    calendar_start: "2025-06-30"
+    calendar_end: "2026-03-31"
+    amount_rmb_million: 87512
+    amount_usd_million: 12687
+"""
+
+
+@pytest.fixture
+def baba_income_dir(tmp_path, monkeypatch):
+    import hidden_stock.quirks.holdings.performance as perf
+
+    (tmp_path / "baba_investment_income.yaml").write_text(BABA_INCOME_YAML, encoding="utf-8")
+    monkeypatch.setattr(perf, "_DATA_DIR", tmp_path)
+    return tmp_path
+
+
+def test_reported_yaml_loads_baba_empty_unknown(baba_income_dir):
     baba = load_reported_investment_income("BABA")
     assert len(baba) >= 3
     assert "FY2026" in set(baba["period_label"])
@@ -330,7 +368,7 @@ def test_reported_yaml_loads_baba_empty_unknown():
     assert len(unknown) == 0
 
 
-def test_reported_vs_est_baba_has_residual_note():
+def test_reported_vs_est_baba_has_residual_note(baba_income_dir):
     rows = [
         {
             "period_end": "2025-06-30",

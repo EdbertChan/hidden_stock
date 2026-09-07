@@ -342,10 +342,10 @@ def diff_snapshots(
             if prev is None and cur is None:
                 continue
 
-            # Drop identity-less empty appears.
+            # Drop identity-less empty appears (no shares, no %, no disclosed $).
             qty_cur = _continuity_qty(cur)
             qty_prev = _continuity_qty(prev)
-            if prev is None and (cur is None or qty_cur <= 0):
+            if prev is None and (cur is None or (qty_cur <= 0 and not (value or 0) > 0)):
                 continue
 
             action, shares, shares_prev, shares_delta = _classify_units(prev, cur)
@@ -355,6 +355,7 @@ def diff_snapshots(
             if k not in first_seen and (
                 (shares is not None and shares > 0)
                 or (qty_cur > 0)
+                or ((value or 0) > 0)
             ):
                 first_seen[k] = period_end
 
@@ -664,6 +665,61 @@ def collect_note_snapshots(
     return snaps, meta
 
 
+def note_grid_periods(
+    note_snaps: list[tuple[str, str, str, list[dict]]],
+    *,
+    before: str,
+    lookback_start: str | None = None,
+    g13_snaps: list[tuple[str, str, str, list[dict]]] | None = None,
+    exited_by_date: dict[str, list[str]] | None = None,
+) -> list[tuple[str, str, str, list[dict]]]:
+    """Period rows from Investments-table column dates that precede the first 13F.
+
+    Each distinct ``as_of_date`` < ``before`` (and >= ``lookback_start``) becomes
+    one period, stamped with the earliest filing that disclosed that column.
+    Rows are the period-aware note union (disclosed FV only — no invented $),
+    with 13G/D positions as of that filing date filling shares / ownership.
+    Oldest → newest.
+    """
+    from .lookback import date_on_or_after
+    from .sec_13g import exited_tickers_as_of, positions_as_of
+
+    before_s = str(before or "")[:10]
+    if not before_s or not note_snaps:
+        return []
+    first_filing: dict[str, tuple[str, str]] = {}
+    for _snap_as_of, filing_date, acc, rows in note_snaps:  # oldest → newest
+        for r in rows:
+            vd = str(r.get("as_of_date") or "")[:10]
+            if not vd or vd >= before_s:
+                continue
+            if lookback_start and not date_on_or_after(vd, lookback_start):
+                continue
+            if r.get("market_value_usd") is None:
+                continue
+            first_filing.setdefault(vd, (filing_date, acc))
+    out: list[tuple[str, str, str, list[dict]]] = []
+    for pe in sorted(first_filing):
+        filing_date, acc = first_filing[pe]
+        notes = _notes_as_of(note_snaps, filing_date, period_end=pe, window=8)
+        notes = [n for n in notes if n.get("market_value_usd") is not None]
+        if not notes:
+            continue
+        g13 = positions_as_of(g13_snaps or [], filing_date)
+        exited = exited_tickers_as_of(exited_by_date, filing_date)
+        if exited:
+            notes = [
+                n for n in notes if (n.get("investee_ticker") or "").strip().upper() not in exited
+            ]
+            g13 = [
+                g for g in g13 if (g.get("investee_ticker") or "").strip().upper() not in exited
+            ]
+        # Notes carry the disclosed $; 13G fills shares / % onto the same ticker.
+        # 13G-only names (no disclosed FV) are kept null-$ like on the 13F grid.
+        out.append((pe, filing_date, acc, _merge_period_rows(notes, g13)))
+    return out
+
+
 def _notes_as_of(
     note_snaps: list[tuple[str, str, str, list[dict]]],
     as_of: str,
@@ -963,7 +1019,8 @@ def build_holdings_history(
     cik = PARENT_CIK_OVERRIDES.get(parent) or edgar.get_cik(parent)
     start = lookback_start_date(as_of=as_of, lookback_years=lookback_years)
     if max_annual_filings is None:
-        max_annual_filings = max(12, int(lookback_years) * 4)
+        # lookback_years=0 means the whole book: do not cap notes at 3 years.
+        max_annual_filings = 400 if int(lookback_years) <= 0 else max(12, int(lookback_years) * 4)
 
     # HK aggregate parents: 13G/D timeline + HKEX annual Note 22 aggregates
     if uses_hk_aggregates(parent):
@@ -1064,6 +1121,21 @@ def build_holdings_history(
 
     # Pre-window: 13F edge rows only (no 13G/note overlays — cost/inception only).
     enriched: list[tuple[str, str, str, list[dict]]] = list(pre_periods)
+
+    # Pre-13F grid: a parent that only began filing 13F recently (UBER: first
+    # 13F-HR is 2024-12-31) still disclosed investee FV in its 10-Q/10-K
+    # Investments table. Those column dates become period rows, so the window
+    # (or the whole book at lookback 0) is not silently cut at the first 13F.
+    first_13f_pe = ordered[0][0]
+    note_grid = note_grid_periods(
+        note_snaps,
+        before=first_13f_pe,
+        lookback_start=start,
+        g13_snaps=g13_snaps,
+        exited_by_date=exited_by_date,
+    )
+    meta["num_note_grid_periods"] = len(note_grid)
+    enriched.extend(note_grid)
 
     for period_end, filing_date, accession, rows in ordered:
         as_of_d = filing_date or period_end
