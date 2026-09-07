@@ -26,6 +26,7 @@ SHEET_RETURNS = "returns_by_period"
 SHEET_REALIZED = "realized_pnl_qoq"
 SHEET_HOLDING_RETURNS = "holding_returns"
 SHEET_REPORTED_VS_EST = "reported_vs_est"
+SHEET_EXPORT_STATUS = "export_status"
 # chart_data tab removed — named stack lives on holdings_qoq_chart (calendar quarters).
 # Thin returns_chart / realized_*_chart tabs removed — Dietz embeds on returns_by_period.
 # hk_composition tab removed — composition_* columns live on positions_qoq.
@@ -528,6 +529,63 @@ def chart_data_frame(
     )
 
 
+def empty_export_note(
+    parent: str,
+    *,
+    num_current: int,
+    num_history: int,
+    build_meta: dict[str, Any] | None = None,
+) -> str | None:
+    """Explicit reason for an export with zero holdings, else None.
+
+    An empty sheet must say why (principle-explicit-errors): PDD's only
+    13D/G filings under its CIK were third parties reporting stakes *in*
+    PDD, so after the self-issuer filter nothing is left — that is the
+    finding, not a silent blank.
+    """
+    if num_current or num_history:
+        return None
+    meta = build_meta or {}
+    if not meta:
+        return (
+            f"no holdings rows for {parent} in stock_data; nothing was rebuilt this run "
+            f"(pass --history / --live to fetch 13F/13G/notes)"
+        )
+    self_n = int(meta.get("num_13g_self_issuer_filings") or 0)
+    parts = [
+        f"no named public equity stakes disclosed via 13F/13G/notes for {parent}; "
+        f"13G filings under the CIK were third-party filings about the parent: {self_n}"
+    ]
+    scanned = meta.get("num_13g_filings")
+    if scanned is not None:
+        parts.append(f"13G filings scanned: {scanned}")
+    if meta.get("num_annual_filings") is not None:
+        parts.append(f"annual/interim notes scanned: {meta.get('num_annual_filings')}")
+    for key in ("error", "13g_error", "13f_error", "inception_error"):
+        if meta.get(key):
+            parts.append(f"{key}={meta[key]}")
+    return "; ".join(parts)
+
+
+def export_status_frame(
+    parent: str, note: str, build_meta: dict[str, Any] | None = None
+) -> pd.DataFrame:
+    meta = build_meta or {}
+    return pd.DataFrame(
+        [
+            {
+                "parent_ticker": parent,
+                "status": "empty_export_explained",
+                "note": note,
+                "num_13g_filings": meta.get("num_13g_filings"),
+                "num_13g_self_issuer_filings": meta.get("num_13g_self_issuer_filings"),
+                "num_annual_filings": meta.get("num_annual_filings"),
+                "lookback_start": meta.get("lookback_start"),
+            }
+        ]
+    )
+
+
 def write_csvs(
     parent: str,
     hold: pd.DataFrame,
@@ -535,6 +593,8 @@ def write_csvs(
     out_dir: Path | str,
     *,
     lookback_start: str | None = None,
+    status_note: str | None = None,
+    build_meta: dict[str, Any] | None = None,
 ) -> dict[str, Path]:
     from .history import assert_unique_period_ticker
     from .sec_13g import known_parent_name_hints
@@ -620,6 +680,12 @@ def write_csvs(
     perf["realized_pnl_qoq"].to_csv(paths["realized_pnl_qoq"], index=False)
     perf["holding_returns"].to_csv(paths["holding_returns"], index=False)
     perf["reported_vs_est"].to_csv(paths["reported_vs_est"], index=False)
+    status_path = out / f"{slug}_export_status.csv"
+    if status_note:
+        export_status_frame(parent, status_note, build_meta).to_csv(status_path, index=False)
+        paths["export_status"] = status_path
+    elif status_path.is_file():
+        status_path.unlink()
     return paths
 
 
@@ -1125,8 +1191,13 @@ def push_google_sheets(
     title: str = "equity holdings",
     create_new: bool | None = None,
     lookback_start: str | None = None,
+    status_note: str | None = None,
+    build_meta: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     """Write data tabs + stacked QoQ chart. By default creates a **new** spreadsheet each call.
+
+    ``status_note`` (see ``empty_export_note``) becomes an ``export_status``
+    tab so an empty book says why; the tab is removed when rows exist.
 
     Service accounts have 0 Drive quota, so new sheets need either:
     - user OAuth token (``GOOGLE_SHEETS_OAUTH_*``), or
@@ -1194,6 +1265,8 @@ def push_google_sheets(
     _replace_worksheet(sh, SHEET_REALIZED, perf["realized_pnl_qoq"])
     _replace_worksheet(sh, SHEET_HOLDING_RETURNS, perf["holding_returns"])
     _replace_worksheet(sh, SHEET_REPORTED_VS_EST, perf["reported_vs_est"])
+    if status_note:
+        _replace_worksheet(sh, SHEET_EXPORT_STATUS, export_status_frame(parent or "", status_note, build_meta))
 
     # Drop legacy thin chart / composition tabs if present.
     for legacy_title in (
@@ -1202,6 +1275,7 @@ def push_google_sheets(
         "returns_chart",
         "realized_chart",
         "realized_by_ticker_chart",
+        *(() if status_note else (SHEET_EXPORT_STATUS,)),
     ):
         try:
             legacy = sh.worksheet(legacy_title)
@@ -1356,11 +1430,25 @@ def export_parent(
             hold = pd.DataFrame(
                 live_holdings_from_history(hist.to_dict(orient="records"))
             )
-    paths = write_csvs(parent, hold, hist, out_dir, lookback_start=lookback_start)
+    status_note = empty_export_note(
+        parent, num_current=len(hold), num_history=len(hist), build_meta=build_meta
+    )
+    paths = write_csvs(
+        parent,
+        hold,
+        hist,
+        out_dir,
+        lookback_start=lookback_start,
+        status_note=status_note,
+        build_meta=build_meta,
+    )
     result: dict[str, Any] = {
         "parent": parent,
         "num_current": len(hold),
         "num_history": len(hist),
+        "num_13g_self_issuer_filings": build_meta.get("num_13g_self_issuer_filings"),
+        "num_self_issuer_dropped": build_meta.get("num_self_issuer_dropped"),
+        "status_note": status_note,
         "lookback_years": lookback_years,
         "lookback_start": lookback_start,
         "csv": {k: str(v) for k, v in paths.items()},
@@ -1375,6 +1463,8 @@ def export_parent(
                 title=f"{parent} equity holdings",
                 create_new=create_new,
                 lookback_start=lookback_start,
+                status_note=status_note,
+                build_meta=build_meta,
             )
             result["sheets"] = sheets
         except Exception as e:

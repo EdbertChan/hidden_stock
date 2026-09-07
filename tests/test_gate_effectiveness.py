@@ -643,6 +643,61 @@ def _self_issuer_under_parent_cik():
 
 
 @defect(
+    "empty_export_unexplained",
+    ("empty_export_unexplained", "empty_export_explained", "empty_export_note"),
+    "a parent whose only 13D/G under its CIK is a third party's stake in the parent: "
+    "zero rows after filtering, exported with no export_status note",
+)
+def _empty_export_unexplained():
+    from hidden_stock.quirks.holdings import export as export_mod
+
+    def fires(ctx: Ctx):
+        edgar = FakeEdgar(g13_items=[SELF_13D], note_filings=[])
+        rows, meta = build_history(edgar, f13=[])
+        assert rows == [] and meta["num_13g_self_issuer_filings"] == 1
+        note = export_mod.empty_export_note(PARENT, num_current=0, num_history=0, build_meta=meta)
+        assert note.startswith(
+            f"no named public equity stakes disclosed via 13F/13G/notes for {PARENT}; "
+            "13G filings under the CIK were third-party filings about the parent: 1"
+        )
+        assert "13G filings scanned: 1" in note
+        assert export_mod.empty_export_note(PARENT, num_current=0, num_history=0) is not None
+
+        empty_hold = pd.DataFrame(columns=HOLDINGS_COLUMNS)
+        empty_hist = pd.DataFrame(rows, columns=HISTORY_COLUMNS)
+        out = ctx.tmp_path / "empty_silent"
+        paths = write_csvs(PARENT, empty_hold, empty_hist, out)
+        assert "export_status" not in paths
+        res = precheck(ctx.grade, out)
+        assert res["checks"]["empty_export_explained"] == "fail"
+        assert "empty_export_unexplained" in _issue_ids(res)
+        assert res["verdict"] == "fail"
+        assert "BOARD: FAIL" in run_grade(ctx.grade, out)[3]
+
+        explained = ctx.tmp_path / "empty_explained"
+        paths = write_csvs(PARENT, empty_hold, empty_hist, explained, status_note=note, build_meta=meta)
+        status = pd.read_csv(paths["export_status"])
+        assert status["note"].iloc[0] == note and int(status["num_13g_self_issuer_filings"].iloc[0]) == 1
+        res = precheck(ctx.grade, explained)
+        assert res["checks"]["empty_export_explained"] == "pass"
+        assert "empty_export_unexplained" not in _issue_ids(res)
+        assert "empty_export_unexplained" not in run_grade(ctx.grade, explained)[3]
+
+        paths = write_csvs(PARENT, empty_hold, empty_hist, explained)
+        assert not (explained / f"{SLUG}_export_status.csv").is_file(), "stale status note kept"
+
+    def silent(ctx: Ctx):
+        assert ctx.clean.mech["checks"]["empty_export_explained"] == "pass"
+        assert "empty_export_unexplained" not in _issue_ids(ctx.clean.mech)
+        assert export_mod.empty_export_note(
+            PARENT, num_current=0, num_history=len(ctx.clean.rows), build_meta=ctx.clean.meta
+        ) is None
+        assert not (ctx.clean.out_dir / f"{SLUG}_export_status.csv").is_file()
+
+    return fires, silent
+
+
+@defect(
     "board_unknown_check",
     ("unknown_check_ids", "write_board"),
     "one mechanical check left at unknown on the clean board",

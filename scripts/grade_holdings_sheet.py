@@ -587,6 +587,33 @@ def mechanical_precheck(
         else:
             checks["no_self_issuer_row"] = "pass"
 
+    checks.setdefault("empty_export_explained", "unknown")
+    if len(hist):
+        checks["empty_export_explained"] = "pass"
+    else:
+        status_csv = history_csv.parent / f"{parent_u.lower().replace('-', '')}_export_status.csv"
+        note = ""
+        if status_csv.is_file():
+            status = pd.read_csv(status_csv)
+            if "note" in status.columns and len(status):
+                note = str(status["note"].iloc[0] or "").strip()
+        if note and note.lower() not in {"nan", "none"}:
+            checks["empty_export_explained"] = "pass"
+        else:
+            issues.append(
+                {
+                    "id": "empty_export_unexplained",
+                    "severity": (
+                        "history has zero rows and no export_status note says why "
+                        "(silent empty book; expected e.g. 'no named public equity stakes "
+                        "disclosed via 13F/13G/notes for <parent>; 13G filings under the CIK "
+                        "were third-party filings about the parent: N')"
+                    ),
+                    "evidence": str(status_csv),
+                }
+            )
+            checks["empty_export_explained"] = "fail"
+
     checks.setdefault("unreconciled_rows", "unknown")
     reconcile_csv = history_csv.parent / f"{parent_u.lower().replace('-', '')}_reconcile.csv"
     if reconcile_csv.is_file():
