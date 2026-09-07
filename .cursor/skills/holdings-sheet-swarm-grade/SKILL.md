@@ -26,6 +26,8 @@ must **not** self-grade as the only check.
 2. **Inputs** (prefer local CSV; sheet URL is for humans):
    - `exports/<ticker>_portfolio_by_period.csv`
    - `exports/<ticker>_equity_holdings_history.csv`
+   - `exports/<ticker>_reconcile.csv` when present (from step 3b; feeds the
+     `unreconciled_rows` precheck, `not_run` without it)
    - optional sheet URL
 3. If `--produce`: run export with **both** flags
 
@@ -34,6 +36,11 @@ set -a && source .env && set +a
 python scripts/export_equity_holdings_sheets.py \
   --ticker <RESOLVED> --live --history --new-sheet
 ```
+
+3b. **Reconcile** the final export before the full grade:
+   `python scripts/reconcile_holdings.py --ticker <RESOLVED>` re-fetches each
+   cited EDGAR filing, checks the sheet's value string is in it plus
+   `data/<parent>_anchors.yaml`, and exits 1 on `not_found` / anchor mismatch.
 
 4. **Grade.** Iterate with `--judge-mode mechanical` (default: precheck +
    derived digest, no LLM). Run `--judge-mode full` **once, on the final
@@ -117,6 +124,14 @@ PASS cannot hide invent on null-`$` rows:
   (`display_basis_cliff`)
 - blank `investee_ticker` on a named public investee (not `ticker=private_note`) → FAIL
   (`blank_public_ticker`)
+- sell/exit in history with no `cost_method=avg` row in `realized_pnl_qoq` → FAIL
+  (`sell_without_realized_row`; `performance_frames` also raises at build time)
+- `<slug>_reconcile.csv` present with any `not_found` / `anchor_mismatch` /
+  `anchor_missing_row` → FAIL (`unreconciled_rows`)
+- calendar quarter missing between min and max `period_end` → NEEDS_WORK (`period_grid_gap`)
+- `abs(dietz_return) > 300%` in any period → NEEDS_WORK (`dietz_sane`)
+- any `judge:check` still `unknown` on the board → NEEDS_WORK, listed under
+  "Unknown checks" (unknown is not PASS)
 
 ## After judgment (required)
 
