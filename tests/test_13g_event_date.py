@@ -41,6 +41,33 @@ Stock in the Issuer's public offering at $4.00 per share.
 </body></html>
 """
 
+SERV_13D_REAL_COVER_HTML = """
+<html><body>
+SCHEDULE 13D
+Serve Robotics Inc. (Name of Issuer)
+81757H105 (CUSIP Number)
+1515 3rd Street San Francisco, CA 94158 (415) 612-8582 (Name, Address and Telephone
+Number of Person Authorized to Receive Notices and Communications :)
+May 8, 2024 ( Date of Event which Requires Filing on Schedule 13D)
+(11) Aggregate Amount Beneficially Owned by Each Reporting Person 5,298,833
+(13) Percent of Class Represented by Amount in Row (11): 15.2%
+Item 5. Interest in Securities of the Issuer.
+(a) The Reporting Person beneficially owns 5,298,833 shares of common stock of the
+Issuer, representing approximately 15.2% of the outstanding shares based on the
+number of shares outstanding reported in the Issuer's prospectus supplement. The
+percentage set forth above is calculated in accordance with Rule 13d-3 under the
+Act and includes shares held through Postmates, a wholly owned subsidiary of the
+Reporting Person. Neutron Holdings and other affiliates disclaim any beneficial
+ownership of the shares reported herein except to the extent of their pecuniary
+interest. (b) The Reporting Person has sole voting and dispositive power over all
+5,298,833 shares reported in Item 5(a) above, and shared voting power over none.
+(c) On April 22, 2024 the Issuer consummated its public offering of 10,000,000
+shares of common stock at a public offering price of $4.00 per share for which the
+Reporting Person (through Postmates) purchased 1,125,000 shares of common stock.
+(d) Not applicable.
+</body></html>
+"""
+
 SERV_13D_NO_COVER_HTML = SERV_13D_HTML.replace(
     "April 22, 2024 (Date of Event Which Requires Filing of this Statement)", ""
 )
@@ -122,6 +149,22 @@ def test_parse_html_cover_event_date_and_item5c():
     no_cover = parse_13g_html(SERV_13D_NO_COVER_HTML)
     assert "event_date" not in no_cover
     assert no_cover["transaction_dates"] == ["2024-04-22"]
+
+
+def test_parse_html_real_13d_cover_wording_and_long_item5():
+    """Mirror of the real SERV 13D: 'Filing on Schedule 13D' cover, Item 5(c) >400 chars in."""
+    parsed = parse_13g_html(SERV_13D_REAL_COVER_HTML)
+    assert parsed["event_date"] == "2024-05-08"
+    assert parsed["transaction_dates"] == ["2024-04-22"]
+    pos = raw_to_position(
+        parsed,
+        parent_ticker="UBER",
+        form="SC 13D",
+        acc="0001552781-24-000296",
+        filing_date="2024-05-08",
+        cik="0001543151",
+    )
+    assert pos is not None and pos["event_date"] == "2024-05-08"
 
 
 def test_parse_xml_event_date_normalised():

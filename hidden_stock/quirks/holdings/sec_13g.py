@@ -123,7 +123,8 @@ def parse_date_token(text: str | None) -> str | None:
 _EVENT_COVER_RE = re.compile(
     r"(?P<date>(?:[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4})|(?:\d{1,2}\s+[A-Za-z]{3,9}\.?,?\s+\d{4})"
     r"|(?:\d{4}-\d{2}-\d{2})|(?:\d{1,2}/\d{1,2}/\d{4}))"
-    r"[\s)\]]{0,6}\(?\s*Date of Event\s+which\s+Requires\s+Filing\s+of\s+this\s+Statement",
+    r"[\s)\]]{0,6}\(?\s*Date of Event\s+which\s+Requires\s+Filing\s+"
+    r"(?:of\s+this\s+Statement|on\s+Schedule\s+13\s*[DG])",
     re.I,
 )
 
@@ -135,20 +136,30 @@ def _cover_event_date(text: str) -> str | None:
     return parse_date_token(m.group("date"))
 
 
-_ITEM5C_RE = re.compile(
-    r"Item\s*5\b.{0,400}?\(\s*c\s*\)(?P<body>.*?)(?=\(\s*d\s*\)|Item\s*6\b|$)",
+_ITEM5_HEAD_RE = re.compile(r"Item\s*5\b", re.I)
+_ITEM5C_BODY_RE = re.compile(
+    r"\(\s*c\s*\)(?P<body>.*?)(?=\(\s*d\s*\)|Item\s*6\b|$)",
     re.I | re.S,
 )
 
 
 def _item5c_transaction_dates(text: str) -> list[str]:
-    """Sorted unique YYYY-MM-DD dates mentioned in Schedule 13D Item 5(c)."""
-    m = _ITEM5C_RE.search(text)
-    if not m:
-        return []
-    body = m.group("body")[:4000]
-    found = {iso for iso in (_iso_date(x) for x in _DATE_TOKEN_RE.finditer(body)) if iso}
-    return sorted(found)
+    """Sorted unique YYYY-MM-DD dates mentioned in Schedule 13D Item 5(c).
+
+    Item 5(a)/(b) can run well past a few hundred characters, so scan each
+    "Item 5" heading's next 8000 characters for the "(c)" sub-item and take the
+    first that mentions any date.
+    """
+    for head in _ITEM5_HEAD_RE.finditer(text):
+        window = text[head.end(): head.end() + 8000]
+        m = _ITEM5C_BODY_RE.search(window)
+        if not m:
+            continue
+        body = m.group("body")[:4000]
+        found = {iso for iso in (_iso_date(x) for x in _DATE_TOKEN_RE.finditer(body)) if iso}
+        if found:
+            return sorted(found)
+    return []
 
 
 def event_date_for(parsed: dict, filing_date: str) -> str:
