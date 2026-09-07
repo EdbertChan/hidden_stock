@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from typing import Any
@@ -11,10 +12,13 @@ import requests
 
 from .identity import (
     ISSUER_TICKER_HINTS,
+    assert_pct_domain,
     clean_issuer_name,
     holding_key,
     resolve_issuer_ticker,
 )
+
+_log = logging.getLogger(__name__)
 
 # Re-export identity helpers for existing imports.
 __all__ = [
@@ -178,13 +182,13 @@ def parse_13g_html(html_text: str) -> dict:
     # so "...Person 0 10 Check Box" yields 0, not row number 10.
     m = re.search(
         r"Aggregate Amount Beneficially Owned by Each Reporting Person"
-        r"[^0-9]{0,40}(?P<sh>[\d,]+)",
+        r"[^0-9]{0,40}(?P<sh>\d[\d,]*)",
         text,
         re.I,
     )
     if not m:
         m = re.search(
-            r"Sole Voting Power[^0-9]{0,40}(?P<sh>[\d,]{4,})",
+            r"Sole Voting Power[^0-9]{0,40}(?P<sh>\d[\d,]{3,})",
             text,
             re.I,
         )
@@ -250,6 +254,14 @@ def raw_to_live_row(
     ticker = resolve_issuer_ticker(name, parsed.get("ticker"), cusip=cusip)
     pct = parsed.get("ownership_pct")
     shares = parsed.get("shares")
+    # 0% is a 13G exit (Item 5 / Aggregate Amount 0); anything else must be
+    # a real stake in (0, 100]. Skip the row, never emit >100.
+    if pct is not None and float(pct) != 0.0:
+        try:
+            pct = assert_pct_domain(pct, field="ownership_pct", context=f"13g {form} {acc} {name}")
+        except ValueError as e:
+            _log.warning("sec_13g: skipping row (%s): %s", e, parsed)
+            return None
     note = f"source=13g form={form} cik={cik}"
     if ticker and str(ticker).startswith("PRIV_") and "ticker=private_note" not in note:
         note = f"{note}; ticker=private_note"

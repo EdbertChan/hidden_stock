@@ -133,6 +133,7 @@ def main() -> int:
                         "recommended_fixes",
                         "root_cause_class",
                         "avoid_next_time",
+                        "unknown_checks",
                     )
                     if k in board
                 },

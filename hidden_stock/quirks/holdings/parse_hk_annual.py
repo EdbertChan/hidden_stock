@@ -201,7 +201,7 @@ def parse_hk_annual_text(
         re.I,
     )
     if m:
-        nums = re.findall(r"\(?([\d,]+)\)?", m.group(1))
+        nums = re.findall(r"\(?(\d[\d,]*)\)?", m.group(1))
         # Assets, Liabilities, Revenues, Profit, OCI, Total, FV — need 7 cells
         if len(nums) >= 7:
             listed_assoc_fv = _num(nums[6]) * 1_000_000
@@ -211,15 +211,15 @@ def parse_hk_annual_text(
     listed_assoc_carrying = None
     unlisted_assoc_carrying = None
     m = re.search(
-        r"Investments in associates\s*[–\-]?\s*Listed entities\s+([\d,]+)\s+[\d,]+"
-        r".{0,60}?Unlisted entities\s+([\d,]+)",
+        r"Investments in associates\s*[–\-]?\s*Listed entities\s+(\d[\d,]*)\s+\d[\d,]*"
+        r".{0,60}?Unlisted entities\s+(\d[\d,]*)",
         text,
         re.I | re.S,
     )
     if not m:
         m = re.search(
-            r"(?<!\()\bListed entities\s+([\d,]+)\s+([\d,]+)\s*"
-            r"[–\-]?\s*Unlisted entities\s+([\d,]+)\s+([\d,]+)",
+            r"(?<!\()\bListed entities\s+(\d[\d,]*)\s+(\d[\d,]*)\s*"
+            r"[–\-]?\s*Unlisted entities\s+(\d[\d,]*)\s+(\d[\d,]*)",
             text,
             re.I | re.S,
         )

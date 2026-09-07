@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as _dt
 import re
 import time
 from typing import Any
@@ -720,6 +721,49 @@ def note_grid_periods(
     return out
 
 
+def assert_note_dates_in_period_grid(
+    note_snaps: list[tuple[str, str, str, list[dict]]],
+    period_ends: list[str] | set[str],
+    *,
+    lookback_start: str | None,
+    upper: str,
+    context: str = "period_grid",
+) -> None:
+    """Every Investments-table column date with disclosed $ must be a period_end.
+
+    The grid was 13F-only once (history.py:586@400c6ed): a 10-Q column date
+    with no 13F period silently lost its $. Scope is column dates within
+    [lookback_start, upper] on rows sourced from an investments table with a
+    non-null market_value_usd. Raises listing the missing dates.
+    """
+    from .lookback import date_on_or_after
+
+    grid = {str(pe or "")[:10] for pe in period_ends}
+    upper_s = str(upper or "")[:10]
+    required: set[str] = set()
+    for _snap_as_of, _filing_date, _acc, rows in note_snaps or []:
+        for r in rows:
+            src = f"{r.get('_source') or ''} {r.get('note') or ''}".lower()
+            if "investments_table" not in src:
+                continue
+            if r.get("market_value_usd") is None:
+                continue
+            vd = str(r.get("as_of_date") or "")[:10]
+            if not vd:
+                continue
+            if lookback_start and not date_on_or_after(vd, lookback_start):
+                continue
+            if upper_s and vd > upper_s:
+                continue
+            required.add(vd)
+    missing = sorted(required - grid)
+    if missing:
+        raise ValueError(
+            f"{context}: Investments-table column date(s) with disclosed $ are not "
+            f"period_end rows (window {lookback_start}..{upper_s}): {', '.join(missing)}"
+        )
+
+
 def _notes_as_of(
     note_snaps: list[tuple[str, str, str, list[dict]]],
     as_of: str,
@@ -1156,6 +1200,13 @@ def build_holdings_history(
 
     meta["num_periods"] = len(enriched)
     meta["num_window_periods"] = len(ordered)
+    # Every in-window Investments-table column date with $ must be on the grid.
+    assert_note_dates_in_period_grid(
+        note_snaps,
+        [pe for pe, _fd, _acc, _rows in enriched],
+        lookback_start=start,
+        upper=str(as_of or _dt.date.today().isoformat())[:10],
+    )
     history = stamp_filing_urls(price_history_rows(diff_snapshots(parent, enriched)), cik=cik)
     if truncated:
         history = stamp_truncated_notes(history, truncated)

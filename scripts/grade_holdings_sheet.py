@@ -112,6 +112,8 @@ def mechanical_precheck(
     """
     parent_u = str(parent or "").strip().upper()
     issues: list[dict] = []
+    # needs_work-class findings: reported as minor_issues, verdict needs_work.
+    soft_issues: list[dict] = []
     checks = {
         "didi_2026_06_30_fv": "n/a" if parent_u != "UBER" else "unknown",
         "grab_aurora_vs_10q": "n/a" if parent_u != "UBER" else "unknown",
@@ -546,6 +548,118 @@ def mechanical_precheck(
         else:
             checks["no_blank_public_ticker"] = "pass"
 
+    # Quarterly grid must be contiguous: a missing calendar quarter between
+    # min and max period_end is a dropped period (note column / 13F not on grid).
+    checks.setdefault("period_grid_gap", "unknown")
+    if "period_end" in hist.columns:
+        pes = sorted({str(x)[:10] for x in hist["period_end"].dropna().astype(str) if str(x)[:10]})
+        q_ends = {"03-31", "06-30", "09-30", "12-31"}
+        if not pes:
+            checks["period_grid_gap"] = "n/a"
+        elif any(pe[5:] not in q_ends for pe in pes):
+            # 13G-date grid (HK aggregate parents): not a quarterly grid.
+            checks["period_grid_gap"] = "n/a"
+        else:
+            def _q(pe: str) -> int:
+                return int(pe[:4]) * 4 + (int(pe[5:7]) - 1) // 3
+
+            def _pe(qi: int) -> str:
+                y, q = divmod(qi, 4)
+                return f"{y}-{('03-31', '06-30', '09-30', '12-31')[q]}"
+
+            have = {_q(pe) for pe in pes}
+            gaps = [_pe(qi) for qi in range(min(have), max(have) + 1) if qi not in have]
+            if gaps:
+                soft_issues.append(
+                    {
+                        "id": "period_grid_gap",
+                        "severity": (
+                            "calendar quarter(s) missing between min and max period_end "
+                            "(period dropped from grid)"
+                        ),
+                        "evidence": gaps[:24],
+                    }
+                )
+                checks["period_grid_gap"] = "fail"
+            else:
+                checks["period_grid_gap"] = "pass"
+
+    # Every sell/exit must have a cost_method=avg row in realized_pnl_qoq
+    # (the realized tab once dropped no-cost-lot sales via a silent `continue`).
+    checks.setdefault("sell_without_realized_row", "unknown")
+    realized_csv = history_csv.parent / history_csv.name.replace(
+        "_equity_holdings_history.csv", "_realized_pnl_qoq.csv"
+    )
+    if {"action", "shares_delta", "period_end", "investee_ticker"} <= set(hist.columns):
+        action_l = hist["action"].astype(str).str.lower()
+        delta = pd.to_numeric(hist["shares_delta"], errors="coerce")
+        sells = hist[action_l.isin({"sell", "exit"}) & delta.notna() & (delta < 0)]
+        if not len(sells):
+            checks["sell_without_realized_row"] = "pass"
+        elif realized_csv.is_file():
+            realized = pd.read_csv(realized_csv)
+            covered: set[tuple[str, str]] = set()
+            if {"period_end", "investee_ticker"} <= set(realized.columns):
+                method = (
+                    realized["cost_method"].astype(str).str.lower()
+                    if "cost_method" in realized.columns
+                    else pd.Series(["avg"] * len(realized), index=realized.index)
+                )
+                for r in realized[method == "avg"].itertuples():
+                    covered.add(
+                        (str(r.period_end), str(r.investee_ticker).strip().upper())
+                    )
+            uncovered = [
+                f"{r.period_end}/{str(r.investee_ticker).strip().upper()}"
+                for r in sells.itertuples()
+                if (str(r.period_end), str(r.investee_ticker).strip().upper()) not in covered
+            ]
+            if uncovered:
+                issues.append(
+                    {
+                        "id": "sell_without_realized_row",
+                        "severity": (
+                            "positions_qoq sell/exit with no cost_method=avg row in "
+                            "realized_pnl_qoq (sale silently dropped from P&L)"
+                        ),
+                        "evidence": uncovered[:20],
+                    }
+                )
+                checks["sell_without_realized_row"] = "fail"
+            else:
+                checks["sell_without_realized_row"] = "pass"
+        else:
+            # Sales exist but no realized CSV to check against: not proven.
+            checks["sell_without_realized_row"] = "unknown"
+
+    # Dietz sanity: |return| > 300% in one period is a phantom row / flow
+    # mis-book (UBER 2018-12-31 read 1,952% from a narrative comma-number).
+    checks.setdefault("dietz_sane", "unknown")
+    returns_csv = history_csv.parent / history_csv.name.replace(
+        "_equity_holdings_history.csv", "_returns_by_period.csv"
+    )
+    if returns_csv.is_file():
+        rets = pd.read_csv(returns_csv)
+        if {"period_end", "dietz_return"} <= set(rets.columns):
+            dz = pd.to_numeric(rets["dietz_return"], errors="coerce")
+            wild = rets[dz.notna() & (dz.abs() > 3.0)]
+            if len(wild):
+                soft_issues.append(
+                    {
+                        "id": "dietz_sane",
+                        "severity": "|dietz_return| > 300% in a period (phantom row / flow mis-book)",
+                        "evidence": [
+                            f"{r.period_end}: {float(r.dietz_return) * 100:.1f}%"
+                            for r in wild.itertuples()
+                        ][:12],
+                    }
+                )
+                checks["dietz_sane"] = "fail"
+            else:
+                checks["dietz_sane"] = "pass"
+        else:
+            checks["dietz_sane"] = "unknown"
+
     good = []
     if not issues:
         good.append(f"Mechanical uniqueness + invent checks passed for parent={parent_u}")
@@ -554,18 +668,22 @@ def mechanical_precheck(
         else:
             good.append("Uber DIDIY/GRAB/AUR anchors skipped (wrong parent)")
 
+    verdict = "fail" if issues else "needs_work" if soft_issues else "pass"
     return {
         "judge": "mechanical",
-        "verdict": "fail" if issues else "pass",
-        "score": 0 if issues else 100,
+        "verdict": verdict,
+        "score": {"fail": 0, "needs_work": 60, "pass": 100}[verdict],
         "blocking_issues": issues,
-        "minor_issues": [],
+        "minor_issues": soft_issues,
         "what_looks_good": good,
         "checks": checks,
         "parent": parent_u,
         "summary": (
             f"Mechanical precheck failed for {parent_u}"
             if issues
+            else f"Mechanical precheck needs work for {parent_u}: "
+            + ", ".join(i["id"] for i in soft_issues)
+            if soft_issues
             else f"Mechanical precheck passed for {parent_u}"
         ),
     }
@@ -786,6 +904,17 @@ def _parse_json_response(text: str, *, judge: str) -> dict:
     return parse_json_response(text, judge=judge)
 
 
+def unknown_check_ids(results: list[dict]) -> list[str]:
+    """`judge:check` ids whose value is literally "unknown" (never evaluated)."""
+    out: list[str] = []
+    for r in results:
+        judge = str(r.get("judge") or "judge")
+        for cid, val in (r.get("checks") or {}).items():
+            if str(val).strip().lower() == "unknown":
+                out.append(f"{judge}:{cid}")
+    return out
+
+
 def write_board(ticker: str, out_dir: Path, results: list[dict], sheet_url: str | None) -> Path:
     path = out_dir / f"{ticker.lower()}_grade_board.md"
     lines = [
@@ -829,12 +958,19 @@ def write_board(ticker: str, out_dir: Path, results: list[dict], sheet_url: str 
             lines.append("")
 
     verdicts = {r.get("verdict") for r in results}
+    unknown_checks = unknown_check_ids(results)
     if "fail" in verdicts:
         board = "BOARD: FAIL"
-    elif "needs_work" in verdicts or len(verdicts) > 1:
+    elif "needs_work" in verdicts or len(verdicts) > 1 or unknown_checks:
+        # An unevaluated check is not evidence of a pass (unknown != PASS).
         board = "BOARD: NEEDS_WORK"
     else:
         board = "BOARD: PASS"
+    if unknown_checks:
+        lines.append("### Unknown checks (cannot PASS until evaluated)")
+        for cid in unknown_checks:
+            lines.append(f"- {cid}")
+        lines.append("")
     lines.insert(3, f"**{board}**")
     lines.insert(4, "")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

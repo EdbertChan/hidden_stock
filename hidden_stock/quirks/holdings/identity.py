@@ -93,6 +93,26 @@ _BOILERPLATE_PREFIX = re.compile(
 )
 
 
+def assert_pct_domain(value, *, field: str, context: str) -> float | None:
+    """Ownership % must be in (0, 100]; None passes through (not disclosed).
+
+    Shared by every parser that emits ``ownership_pct`` (13G, broker SOTP,
+    notes). A peer-comp table once shipped a 612% "stake" (83a0535) and a
+    narrative comma-number a 1,952% Dietz period (ecdb97b): domain checks
+    live here, not per parser. Raises ValueError with field/context so the
+    caller can skip and log the single bad row instead of crashing the run.
+    """
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{context}: {field}={value!r} is not numeric") from None
+    if v != v or not (0.0 < v <= 100.0):
+        raise ValueError(f"{context}: {field}={v!r} outside (0, 100]")
+    return v
+
+
 def load_cusip_tickers(path: Path | None = None) -> dict[str, str]:
     out = dict(_DEFAULT_CUSIP_TICKERS)
     if path is None:

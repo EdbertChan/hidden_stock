@@ -690,3 +690,43 @@ def test_mv_only_appearance_is_flow_not_mtm_even_if_counted_later():
     # 2019-09-30: Didi gets a share count with no delta → no phantom $7.95B buy.
     assert abs(r.loc["2019-09-30", "net_external_flow"]) < 1.0
     assert abs(r.loc["2019-09-30", "dietz_return"]) < 0.01
+
+
+def test_assert_sell_realized_coverage_raises_on_uncovered_sell():
+    """Every sell/exit with shares_delta<0 needs an avg-cost realized event."""
+    from hidden_stock.quirks.holdings.performance import assert_sell_realized_coverage
+
+    rows = [
+        {"period_end": "2024-03-31", "investee_ticker": "A", "action": "sell", "shares_delta": -5.0},
+        {"period_end": "2024-06-30", "investee_ticker": "B", "action": "exit", "shares_delta": -3.0},
+        {"period_end": "2024-06-30", "investee_ticker": "C", "action": "buy", "shares_delta": 2.0},
+    ]
+    covered = [
+        {"period_end": "2024-03-31", "investee_ticker": "A", "cost_method": "avg"},
+        # FIFO-only coverage does not count; B is uncovered.
+        {"period_end": "2024-06-30", "investee_ticker": "B", "cost_method": "fifo"},
+    ]
+    with pytest.raises(AssertionError) as ei:
+        assert_sell_realized_coverage(rows, covered)
+    assert "2024-06-30/B" in str(ei.value)
+    assert "2024-03-31/A" not in str(ei.value)
+    # Full coverage passes silently.
+    covered.append({"period_end": "2024-06-30", "investee_ticker": "B", "cost_method": "avg"})
+    assert_sell_realized_coverage(rows, covered) is None
+
+
+def test_performance_frames_raises_when_sell_has_no_realized_event(monkeypatch):
+    """performance_frames must not ship a sale that lost its realized row."""
+    import hidden_stock.quirks.holdings.performance as perf
+
+    rows = [
+        {"period_end": "2024-03-31", "investee_ticker": "A", "action": "new",
+         "shares_held": 10.0, "shares_delta": 10.0, "market_value_usd": 100.0},
+        {"period_end": "2024-06-30", "investee_ticker": "A", "action": "sell",
+         "shares_held": 5.0, "shares_prev": 10.0, "shares_delta": -5.0,
+         "market_value_usd": 60.0, "value_prev": 100.0},
+    ]
+    # Simulate the old `continue` that silently dropped the sale.
+    monkeypatch.setattr(perf, "build_lots_and_realized", lambda *a, **k: ([], []))
+    with pytest.raises(AssertionError, match="sell_realized_coverage"):
+        perf.performance_frames(rows)
