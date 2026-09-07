@@ -11,8 +11,9 @@ SERV_13D_HTML is a trimmed mirror of e24231_uberserv-sc13d.htm (accession
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+from hidden_stock.quirks.holdings.history import build_holdings_history, note_grid_periods
 from hidden_stock.quirks.holdings.sec_13g import (
     collect_13g_period_snapshots,
     exited_tickers_as_of,
@@ -88,6 +89,31 @@ def _serv_pos(event_date: str, filing_date: str, acc: str = "serv-13d") -> dict:
     }
 
 
+def _f13(pe: str, fd: str, acc: str) -> tuple:
+    return (
+        pe,
+        fd,
+        acc,
+        [
+            {
+                "investee_name": "GRAB",
+                "investee_ticker": "GRAB",
+                "shares_held": 1e6,
+                "market_value_usd": 10.0,
+                "_cusip": "G4124C109",
+                "note": "source=sec_api_13f",
+            }
+        ],
+    )
+
+
+def _edgar():
+    edgar = MagicMock()
+    edgar.get_cik.return_value = "0001543151"
+    edgar.user_agent = "test"
+    return edgar
+
+
 def test_parse_html_cover_event_date_and_item5c():
     parsed = parse_13g_html(SERV_13D_HTML)
     assert parsed["event_date"] == "2024-04-22"
@@ -146,6 +172,111 @@ def test_positions_as_of_by_event_date():
     assert positions_as_of(snaps, "2024-06-30", by="event")[0]["investee_ticker"] == "SERV"
     assert positions_as_of(snaps, "2024-05-07", by="filing") == []
     assert positions_as_of(snaps, "2024-05-08", by="filing")[0]["investee_ticker"] == "SERV"
+
+
+def test_13d_filed_in_45_day_window_lands_in_event_quarter():
+    """SERV 13D: event 2024-04-22, filed 2024-05-08 -> 2024-06-30 row, not 2024-03-31."""
+    f13_periods = [
+        _f13("2024-03-31", "2024-05-15", "q1"),
+        _f13("2024-06-30", "2024-08-14", "q2"),
+    ]
+    g13_snaps = [
+        ("2024-04-22", "2024-05-08", "serv-13d", [_serv_pos("2024-04-22", "2024-05-08")]),
+    ]
+    with (
+        patch(
+            "hidden_stock.quirks.holdings.history._collect_13f_periods",
+            return_value=(f13_periods, {"error": None, "num_periods": 2}),
+        ),
+        patch(
+            "hidden_stock.quirks.holdings.sec_13g.collect_13g_period_snapshots",
+            return_value=(g13_snaps, {"num_filings": 1, "num_periods": 1, "exited_by_date": {}}),
+        ),
+        patch(
+            "hidden_stock.quirks.holdings.history.collect_note_snapshots",
+            return_value=([], {"num_annual_filings": 0, "num_note_snapshots": 0}),
+        ),
+    ):
+        hist, _meta = build_holdings_history(parent_ticker="UBER", edgar=_edgar(), max_filings=5)
+    serv = sorted((r["period_end"], r["action"], r["shares_held"]) for r in hist if r["investee_ticker"] == "SERV")
+    assert serv == [("2024-06-30", "new", 5_298_833.0)]
+
+
+def test_13ga_exit_with_event_in_prior_quarter_exits_that_quarter():
+    """Exit event 2024-03-21 filed 2024-04-10 (inside the 45-day window) exits at 2024-03-31."""
+    f13_periods = [
+        _f13("2023-12-31", "2024-02-14", "q4"),
+        _f13("2024-03-31", "2024-05-15", "q1"),
+        _f13("2024-06-30", "2024-08-14", "q2"),
+    ]
+    bili = {
+        "investee_name": "Bilibili Inc.",
+        "investee_ticker": "BILI",
+        "shares_held": 1_000_000.0,
+        "ownership_pct": 6.0,
+        "market_value_usd": None,
+        "_cusip": "G10970112",
+        "_source": "13g",
+        "note": "source=13g form=SC 13G event_date=2023-12-31",
+        "as_of_date": "2024-02-09",
+        "as_of_accession_no": "bili-13g",
+        "event_date": "2023-12-31",
+    }
+    g13_snaps = [
+        ("2023-12-31", "2024-02-09", "bili-13g", [bili]),
+        ("2024-03-21", "2024-04-10", "bili-13ga-exit", []),
+    ]
+    exited_by_date = {"2024-03-21": ["BILI"]}
+    with (
+        patch(
+            "hidden_stock.quirks.holdings.history._collect_13f_periods",
+            return_value=(f13_periods, {"error": None, "num_periods": 3}),
+        ),
+        patch(
+            "hidden_stock.quirks.holdings.sec_13g.collect_13g_period_snapshots",
+            return_value=(g13_snaps, {"num_filings": 2, "num_periods": 2, "exited_by_date": exited_by_date}),
+        ),
+        patch(
+            "hidden_stock.quirks.holdings.history.collect_note_snapshots",
+            return_value=([], {"num_annual_filings": 0, "num_note_snapshots": 0}),
+        ),
+    ):
+        hist, _meta = build_holdings_history(parent_ticker="UBER", edgar=_edgar(), max_filings=5)
+    rows = sorted((r["period_end"], r["action"]) for r in hist if r["investee_ticker"] == "BILI")
+    assert rows == [("2023-12-31", "new"), ("2024-03-31", "exit")]
+    assert exited_tickers_as_of(exited_by_date, "2024-03-31") == {"BILI"}
+    assert exited_tickers_as_of(exited_by_date, "2024-03-20") == set()
+
+
+def test_note_grid_periods_overlay_13g_by_event_date():
+    """13D filed 2024-05-08 (before the 10-Q filed 2024-05-09) must not leak into the 2024-03-31 column."""
+
+    def _note(ticker, as_of, usd, acc):
+        return {
+            "investee_name": ticker,
+            "investee_ticker": ticker,
+            "shares_held": None,
+            "ownership_pct": None,
+            "market_value_usd": usd,
+            "as_of_date": as_of,
+            "as_of_accession_no": acc,
+            "_cusip": None,
+            "cusip": None,
+            "_source": "10q_investments_table",
+            "note": f"source=10q_investments_table as_of={as_of} fv_usd={usd:.0f}",
+        }
+
+    note_snaps = [
+        ("2024-05-09", "2024-05-09", "q1-24", [_note("SERV", "2024-03-31", 1.0e7, "q1-24")]),
+        ("2024-08-06", "2024-08-06", "q2-24", [_note("SERV", "2024-06-30", 2.0e7, "q2-24")]),
+    ]
+    g13_snaps = [
+        ("2024-04-22", "2024-05-08", "serv-13d", [_serv_pos("2024-04-22", "2024-05-08")]),
+    ]
+    grid = note_grid_periods(note_snaps, before="2024-12-31", lookback_start="2000-01-01", g13_snaps=g13_snaps)
+    by = {(pe, r["investee_ticker"]): r for pe, _fd, _acc, rows in grid for r in rows}
+    assert by[("2024-03-31", "SERV")]["shares_held"] is None
+    assert by[("2024-06-30", "SERV")]["shares_held"] == 5_298_833.0
 
 
 def test_collect_13g_period_snapshots_orders_by_event_date():

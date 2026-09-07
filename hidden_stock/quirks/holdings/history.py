@@ -679,8 +679,8 @@ def note_grid_periods(
     Each distinct ``as_of_date`` < ``before`` (and >= ``lookback_start``) becomes
     one period, stamped with the earliest filing that disclosed that column.
     Rows are the period-aware note union (disclosed FV only — no invented $),
-    with 13G/D positions as of that filing date filling shares / ownership.
-    Oldest → newest.
+    with 13G/D positions whose event_date <= the column date filling shares /
+    ownership. Oldest → newest.
     """
     from .lookback import date_on_or_after
     from .sec_13g import exited_tickers_as_of, positions_as_of
@@ -706,8 +706,8 @@ def note_grid_periods(
         notes = [n for n in notes if n.get("market_value_usd") is not None]
         if not notes:
             continue
-        g13 = positions_as_of(g13_snaps or [], filing_date)
-        exited = exited_tickers_as_of(exited_by_date, filing_date)
+        g13 = positions_as_of(g13_snaps or [], pe, by="event")
+        exited = exited_tickers_as_of(exited_by_date, pe)
         if exited:
             notes = [
                 n for n in notes if (n.get("investee_ticker") or "").strip().upper() not in exited
@@ -1183,10 +1183,10 @@ def build_holdings_history(
 
     for period_end, filing_date, accession, rows in ordered:
         as_of_d = filing_date or period_end
-        g13 = positions_as_of(g13_snaps, as_of_d)
+        g13 = positions_as_of(g13_snaps, period_end, by="event")
         notes = _notes_as_of(note_snaps, as_of_d, period_end=period_end, window=8)
         # 13G/D cessation must not be resurrected by a stale 20-F/% note (BILI class).
-        exited = exited_tickers_as_of(exited_by_date, as_of_d)
+        exited = exited_tickers_as_of(exited_by_date, period_end)
         if exited:
             notes = [
                 n
