@@ -42,3 +42,6 @@ backtest_report_data.json
 
 # Curated per-parent cost lots (stock-specific; keep local)
 **/data/*_cost_basis.yaml
+
+# Curated per-parent reconcile truths (stock-specific; keep local)
+**/data/*_anchors.yaml

@@ -548,6 +548,48 @@ def mechanical_precheck(
         else:
             checks["no_blank_public_ticker"] = "pass"
 
+    checks.setdefault("unreconciled_rows", "unknown")
+    reconcile_csv = history_csv.parent / f"{parent_u.lower().replace('-', '')}_reconcile.csv"
+    if reconcile_csv.is_file():
+        try:
+            from hidden_stock.quirks.holdings.reconcile import (
+                FAILING_STATUSES,
+                read_reconcile_csv,
+            )
+
+            rec = read_reconcile_csv(reconcile_csv)
+            bad_rows = [r for r in rec if r.get("status") in FAILING_STATUSES]
+            if bad_rows:
+                sample = "; ".join(
+                    f"{r.get('status')} {r.get('period_end')}/{r.get('investee_ticker')} "
+                    f"searched={r.get('searched')}"
+                    for r in bad_rows[:8]
+                )
+                issues.append(
+                    {
+                        "id": "unreconciled_rows",
+                        "severity": (
+                            f"{len(bad_rows)} reconcile row(s) not_found / anchor mismatch "
+                            f"in {reconcile_csv.name} (scripts/reconcile_holdings.py)"
+                        ),
+                        "evidence": sample,
+                    }
+                )
+                checks["unreconciled_rows"] = "fail"
+            else:
+                checks["unreconciled_rows"] = "pass"
+        except Exception as e:
+            issues.append(
+                {
+                    "id": "unreconciled_rows_check_error",
+                    "severity": f"could not read {reconcile_csv}",
+                    "evidence": f"{type(e).__name__}: {e}",
+                }
+            )
+            checks["unreconciled_rows"] = "fail"
+    else:
+        checks["unreconciled_rows"] = "not_run"
+
     # Quarterly grid must be contiguous: a missing calendar quarter between
     # min and max period_end is a dropped period (note column / 13F not on grid).
     checks.setdefault("period_grid_gap", "unknown")
