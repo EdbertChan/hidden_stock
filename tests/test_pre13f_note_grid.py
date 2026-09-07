@@ -133,3 +133,45 @@ def test_list_filings_pages_older_submission_files():
     assert [f["accession_no"] for f in many] == ["r1", "o1", "o2"]
     # Older file fetched only when ``recent`` could not satisfy the limit.
     assert sum(u.endswith("submissions-001.json") for u in calls) == 1
+
+
+def test_build_holdings_history_raises_when_note_column_date_missing_from_grid():
+    """A disclosed Investments-table column date inside the window must be a period_end.
+
+    13F grid starts 2024-12-31; the 10-Q column 2025-03-31 carries $ but no 13F
+    period exists for it, so the $ would silently vanish from the history.
+    """
+    import pytest
+
+    f13 = [("2024-12-31", "2025-02-14", "f-24q4", [
+        {"investee_name": "GRAB", "investee_ticker": "GRAB", "shares_held": 1.0, "market_value_usd": 2.5e9, "_cusip": "G4124C109", "note": "source=sec_api_13f"},
+    ])]
+    snaps = [
+        ("2025-05-07", "2025-05-07", "q1-25", [
+            _note("DIDIY", "2024-12-31", 3.0e9, "q1-25"),
+            _note("DIDIY", "2025-03-31", 3.1e9, "q1-25"),
+        ]),
+    ]
+    edgar = MagicMock(); edgar.get_cik.return_value = "0001543151"; edgar.user_agent = "test"
+    with (
+        patch("hidden_stock.quirks.holdings.history._collect_13f_periods", return_value=(f13, {"num_filings": 1})),
+        patch("hidden_stock.quirks.holdings.sec_13g.collect_13g_period_snapshots", return_value=([], {"num_filings": 0, "num_periods": 0, "exited_by_date": {}})),
+        patch("hidden_stock.quirks.holdings.history.collect_note_snapshots", return_value=(snaps, {"num_annual_filings": 1, "num_note_snapshots": 1})),
+        patch("hidden_stock.quirks.holdings.inception.collect_prewindow_edge_periods", return_value=([], set(), {})),
+    ):
+        with pytest.raises(ValueError, match=r"period_grid.*2025-03-31"):
+            build_holdings_history(parent_ticker="UBER", edgar=edgar, max_filings=5, as_of="2026-09-06", lookback_years=0)
+
+
+def test_assert_note_dates_in_period_grid_ignores_out_of_window_and_null_dollar():
+    from hidden_stock.quirks.holdings.history import assert_note_dates_in_period_grid
+
+    snaps = [("2025-05-07", "2025-05-07", "q1-25", [
+        _note("DIDIY", "2019-12-31", 1.0e9, "old"),      # before window
+        _note("DIDIY", "2025-03-31", 3.1e9, "q1-25"),    # in grid
+        {**_note("GRAB", "2025-06-30", 0.0, "q1-25"), "market_value_usd": None},  # null $
+        _note("GRAB", "2030-12-31", 9.9e9, "future"),    # after as_of
+    ])]
+    assert_note_dates_in_period_grid(
+        snaps, ["2025-03-31"], lookback_start="2020-01-01", upper="2026-09-06"
+    )

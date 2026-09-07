@@ -112,6 +112,8 @@ def mechanical_precheck(
     """
     parent_u = str(parent or "").strip().upper()
     issues: list[dict] = []
+    # needs_work-class findings: reported as minor_issues, verdict needs_work.
+    soft_issues: list[dict] = []
     checks = {
         "didi_2026_06_30_fv": "n/a" if parent_u != "UBER" else "unknown",
         "grab_aurora_vs_10q": "n/a" if parent_u != "UBER" else "unknown",
@@ -546,6 +548,42 @@ def mechanical_precheck(
         else:
             checks["no_blank_public_ticker"] = "pass"
 
+    # Quarterly grid must be contiguous: a missing calendar quarter between
+    # min and max period_end is a dropped period (note column / 13F not on grid).
+    checks.setdefault("period_grid_gap", "unknown")
+    if "period_end" in hist.columns:
+        pes = sorted({str(x)[:10] for x in hist["period_end"].dropna().astype(str) if str(x)[:10]})
+        q_ends = {"03-31", "06-30", "09-30", "12-31"}
+        if not pes:
+            checks["period_grid_gap"] = "n/a"
+        elif any(pe[5:] not in q_ends for pe in pes):
+            # 13G-date grid (HK aggregate parents): not a quarterly grid.
+            checks["period_grid_gap"] = "n/a"
+        else:
+            def _q(pe: str) -> int:
+                return int(pe[:4]) * 4 + (int(pe[5:7]) - 1) // 3
+
+            def _pe(qi: int) -> str:
+                y, q = divmod(qi, 4)
+                return f"{y}-{('03-31', '06-30', '09-30', '12-31')[q]}"
+
+            have = {_q(pe) for pe in pes}
+            gaps = [_pe(qi) for qi in range(min(have), max(have) + 1) if qi not in have]
+            if gaps:
+                soft_issues.append(
+                    {
+                        "id": "period_grid_gap",
+                        "severity": (
+                            "calendar quarter(s) missing between min and max period_end "
+                            "(period dropped from grid)"
+                        ),
+                        "evidence": gaps[:24],
+                    }
+                )
+                checks["period_grid_gap"] = "fail"
+            else:
+                checks["period_grid_gap"] = "pass"
+
     # Every sell/exit must have a cost_method=avg row in realized_pnl_qoq
     # (the realized tab once dropped no-cost-lot sales via a silent `continue`).
     checks.setdefault("sell_without_realized_row", "unknown")
@@ -602,18 +640,22 @@ def mechanical_precheck(
         else:
             good.append("Uber DIDIY/GRAB/AUR anchors skipped (wrong parent)")
 
+    verdict = "fail" if issues else "needs_work" if soft_issues else "pass"
     return {
         "judge": "mechanical",
-        "verdict": "fail" if issues else "pass",
-        "score": 0 if issues else 100,
+        "verdict": verdict,
+        "score": {"fail": 0, "needs_work": 60, "pass": 100}[verdict],
         "blocking_issues": issues,
-        "minor_issues": [],
+        "minor_issues": soft_issues,
         "what_looks_good": good,
         "checks": checks,
         "parent": parent_u,
         "summary": (
             f"Mechanical precheck failed for {parent_u}"
             if issues
+            else f"Mechanical precheck needs work for {parent_u}: "
+            + ", ".join(i["id"] for i in soft_issues)
+            if soft_issues
             else f"Mechanical precheck passed for {parent_u}"
         ),
     }

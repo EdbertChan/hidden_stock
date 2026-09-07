@@ -123,3 +123,34 @@ def test_board_all_checks_resolved_is_pass(grade, tmp_path):
     ]
     text = grade.write_board("BABA", tmp_path, results, None).read_text(encoding="utf-8")
     assert "BOARD: PASS" in text
+
+
+def test_period_grid_gap_flags_missing_calendar_quarter(grade, tmp_path):
+    rows = [
+        _hist_row("2024-03-31", "A", "new", 10.0),
+        _hist_row("2024-09-30", "A", "hold", 0.0),
+        _hist_row("2025-03-31", "A", "hold", 0.0),
+    ]
+    hist, port = _write(tmp_path, "baba", rows, realized_rows=[])
+    res = grade.mechanical_precheck(hist, port, parent="BABA")
+    assert res["checks"]["period_grid_gap"] == "fail"
+    gap = next(i for i in res["minor_issues"] if i["id"] == "period_grid_gap")
+    assert gap["evidence"] == ["2024-06-30", "2024-12-31"]
+    assert res["verdict"] == "needs_work"
+    assert not res["blocking_issues"]
+
+
+def test_period_grid_gap_contiguous_quarters_pass(grade, tmp_path):
+    rows = [_hist_row(pe, "A", "hold", 0.0) for pe in ("2024-03-31", "2024-06-30", "2024-09-30")]
+    hist, port = _write(tmp_path, "baba", rows, realized_rows=[])
+    res = grade.mechanical_precheck(hist, port, parent="BABA")
+    assert res["checks"]["period_grid_gap"] == "pass"
+    assert res["verdict"] == "pass"
+
+
+def test_period_grid_gap_not_applicable_on_13g_date_grid(grade, tmp_path):
+    """HK parents use 13G filing dates as period_end — not a quarterly grid."""
+    rows = [_hist_row(pe, "A", "hold", 0.0) for pe in ("2024-02-14", "2024-11-20")]
+    hist, port = _write(tmp_path, "tcehy", rows, realized_rows=[])
+    res = grade.mechanical_precheck(hist, port, parent="TCEHY")
+    assert res["checks"]["period_grid_gap"] == "n/a"
