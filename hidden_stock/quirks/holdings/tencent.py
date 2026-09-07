@@ -155,6 +155,7 @@ def build_13g_reporter_history(
     user_agent: str,
     max_filings: int = 80,
     lookback_start: str | None = None,
+    parent_name_hints: list[str] | None = None,
 ) -> tuple[list[dict], dict]:
     """QoQ history for Tencent: SC 13G/D + HKEX annual aggregates."""
     from .history import diff_snapshots
@@ -169,6 +170,7 @@ def build_13g_reporter_history(
         user_agent=user_agent,
         max_filings=max_filings,
         lookback_start=lookback_start,
+        parent_name_hints=parent_name_hints,
     )
     meta["parent_ticker"] = parent
     meta["strategy"] = "fanout_13g_hk"
@@ -248,7 +250,9 @@ def build_13g_reporter_history(
     return history, meta
 
 
-def build_tencent_holdings(*, user_agent: str) -> tuple[list[dict], dict]:
+def build_tencent_holdings(
+    *, user_agent: str, parent_name_hints: list[str] | None = None
+) -> tuple[list[dict], dict]:
     """Live snapshot = open positions slice of QoQ history (single SoT)."""
     from .composition import live_holdings_from_history
     from .lookback import lookback_start_date
@@ -258,6 +262,7 @@ def build_tencent_holdings(*, user_agent: str) -> tuple[list[dict], dict]:
         user_agent=user_agent,
         max_filings=120,
         lookback_start=lookback_start_date(lookback_years=8),
+        parent_name_hints=parent_name_hints,
     )
     meta["source"] = "history_slice+hk_annual_report+sec_13g+broker_sotp"
     rows = live_holdings_from_history(hist)
