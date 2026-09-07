@@ -8,12 +8,17 @@ Provenance lives on ``note`` (``value_source=broker_sotp``) — no separate tabl
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from pathlib import Path
 from typing import Any, Literal
 from urllib.request import Request, urlopen
 
 import yaml
+
+from .identity import assert_pct_domain
+
+_log = logging.getLogger(__name__)
 
 # Internal parse shape (not a public DB/export schema).
 BROKER_SOTP_COLUMNS = [
@@ -296,11 +301,19 @@ def _row_from_match(m: re.Match[str]) -> dict[str, Any] | None:
         name,
         flags=re.I,
     ).strip()
+    try:
+        stake = assert_pct_domain(
+            m.group("stake"), field="ownership_pct", context=f"broker_sotp {name}"
+        )
+    except ValueError as e:
+        # Peer-comp tables (price / mcap / P/E) read as 612% "stakes" — skip.
+        _log.warning("broker_sotp: skipping row (%s): %r", e, m.group(0)[:120])
+        return None
     return {
         "investee_name": name,
         "investee_ticker_raw": raw_t,
         "investee_ticker": ticker,
-        "ownership_pct": float(m.group("stake")),
+        "ownership_pct": stake,
         "mkt_cap_usd_mn": float(m.group("mcap").replace(",", "")),
         "value_to_parent_hkd_mn": float(m.group("value").replace(",", "")),
     }

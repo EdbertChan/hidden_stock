@@ -154,3 +154,28 @@ def test_period_grid_gap_not_applicable_on_13g_date_grid(grade, tmp_path):
     hist, port = _write(tmp_path, "tcehy", rows, realized_rows=[])
     res = grade.mechanical_precheck(hist, port, parent="TCEHY")
     assert res["checks"]["period_grid_gap"] == "n/a"
+
+
+def test_dietz_sane_flags_period_over_300pct(grade, tmp_path):
+    rows = [_hist_row("2024-03-31", "A", "new", 10.0), _hist_row("2024-06-30", "A", "hold", 0.0)]
+    hist, port = _write(tmp_path, "uber", rows, realized_rows=[], returns_rows=[
+        {"period_end": "2024-03-31", "dietz_return": None},
+        {"period_end": "2024-06-30", "dietz_return": 19.52},
+    ])
+    res = grade.mechanical_precheck(hist, port, parent="UBER")
+    assert res["checks"]["dietz_sane"] == "fail"
+    d = next(i for i in res["minor_issues"] if i["id"] == "dietz_sane")
+    assert d["evidence"] == ["2024-06-30: 1952.0%"]
+    assert res["verdict"] == "needs_work"
+
+
+def test_dietz_sane_passes_and_is_unknown_without_returns_csv(grade, tmp_path):
+    rows = [_hist_row("2024-03-31", "A", "new", 10.0), _hist_row("2024-06-30", "A", "hold", 0.0)]
+    hist, port = _write(tmp_path, "uber", rows, realized_rows=[], returns_rows=[
+        {"period_end": "2024-06-30", "dietz_return": -2.99},
+    ])
+    assert grade.mechanical_precheck(hist, port, parent="UBER")["checks"]["dietz_sane"] == "pass"
+    sub = tmp_path / "no_returns"
+    sub.mkdir()
+    hist2, port2 = _write(sub, "uber", rows, realized_rows=[])
+    assert grade.mechanical_precheck(hist2, port2, parent="UBER")["checks"]["dietz_sane"] == "unknown"

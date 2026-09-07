@@ -632,6 +632,34 @@ def mechanical_precheck(
             # Sales exist but no realized CSV to check against: not proven.
             checks["sell_without_realized_row"] = "unknown"
 
+    # Dietz sanity: |return| > 300% in one period is a phantom row / flow
+    # mis-book (UBER 2018-12-31 read 1,952% from a narrative comma-number).
+    checks.setdefault("dietz_sane", "unknown")
+    returns_csv = history_csv.parent / history_csv.name.replace(
+        "_equity_holdings_history.csv", "_returns_by_period.csv"
+    )
+    if returns_csv.is_file():
+        rets = pd.read_csv(returns_csv)
+        if {"period_end", "dietz_return"} <= set(rets.columns):
+            dz = pd.to_numeric(rets["dietz_return"], errors="coerce")
+            wild = rets[dz.notna() & (dz.abs() > 3.0)]
+            if len(wild):
+                soft_issues.append(
+                    {
+                        "id": "dietz_sane",
+                        "severity": "|dietz_return| > 300% in a period (phantom row / flow mis-book)",
+                        "evidence": [
+                            f"{r.period_end}: {float(r.dietz_return) * 100:.1f}%"
+                            for r in wild.itertuples()
+                        ][:12],
+                    }
+                )
+                checks["dietz_sane"] = "fail"
+            else:
+                checks["dietz_sane"] = "pass"
+        else:
+            checks["dietz_sane"] = "unknown"
+
     good = []
     if not issues:
         good.append(f"Mechanical uniqueness + invent checks passed for parent={parent_u}")
