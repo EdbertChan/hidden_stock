@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as _dt
 import logging
 import re
 import time
@@ -35,6 +36,8 @@ __all__ = [
     "fetch_latest_13g_holdings",
     "exited_tickers_as_of",
     "positions_as_of",
+    "event_date_for",
+    "parse_date_token",
 ]
 
 _MONTH_NAMES = {
@@ -53,8 +56,130 @@ _MONTH_NAMES = {
 }
 
 
+_MONTH_NUM = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+
+_DATE_TOKEN_RE = re.compile(
+    r"(?P<mdy>(?P<mon>[A-Za-z]{3,9})\.?\s+(?P<d>\d{1,2}),?\s+(?P<y>\d{4}))"
+    r"|(?P<dmy>(?P<d2>\d{1,2})\s+(?P<mon2>[A-Za-z]{3,9})\.?,?\s+(?P<y2>\d{4}))"
+    r"|(?P<iso>(?P<yi>\d{4})-(?P<mi>\d{2})-(?P<di>\d{2}))"
+    r"|(?P<slash>(?P<ms>\d{1,2})/(?P<ds>\d{1,2})/(?P<ys>\d{4}))"
+)
+
+
 def _local(tag: str) -> str:
     return tag.split("}")[-1]
+
+
+def _month_num(name: str) -> int | None:
+    low = (name or "").strip().lower().rstrip(".")
+    for full, num in _MONTH_NUM.items():
+        if low == full or (len(low) >= 3 and full.startswith(low)):
+            return num
+    return None
+
+
+def _iso_date(m: re.Match) -> str | None:
+    """Normalise one ``_DATE_TOKEN_RE`` match to YYYY-MM-DD (None if not a real date)."""
+    try:
+        if m.group("mdy"):
+            mon = _month_num(m.group("mon"))
+            y, d = int(m.group("y")), int(m.group("d"))
+        elif m.group("dmy"):
+            mon = _month_num(m.group("mon2"))
+            y, d = int(m.group("y2")), int(m.group("d2"))
+        elif m.group("iso"):
+            mon, y, d = int(m.group("mi")), int(m.group("yi")), int(m.group("di"))
+        else:
+            mon, y, d = int(m.group("ms")), int(m.group("ys")), int(m.group("ds"))
+        if mon is None:
+            return None
+        return _dt.date(y, mon, d).isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_date_token(text: str | None) -> str | None:
+    """First recognisable date in ``text`` as YYYY-MM-DD, else None."""
+    for m in _DATE_TOKEN_RE.finditer(str(text or "")):
+        iso = _iso_date(m)
+        if iso:
+            return iso
+    return None
+
+
+_EVENT_COVER_RE = re.compile(
+    r"(?P<date>(?:[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4})|(?:\d{1,2}\s+[A-Za-z]{3,9}\.?,?\s+\d{4})"
+    r"|(?:\d{4}-\d{2}-\d{2})|(?:\d{1,2}/\d{1,2}/\d{4}))"
+    r"[\s)\]]{0,6}\(?\s*Date of Event\s+which\s+Requires\s+Filing\s+"
+    r"(?:of\s+this\s+Statement|on\s+Schedule\s+13\s*[DG])",
+    re.I,
+)
+
+
+def _cover_event_date(text: str) -> str | None:
+    m = _EVENT_COVER_RE.search(text)
+    if not m:
+        return None
+    return parse_date_token(m.group("date"))
+
+
+_ITEM5_HEAD_RE = re.compile(r"Item\s*5\b", re.I)
+_ITEM5C_BODY_RE = re.compile(
+    r"\(\s*c\s*\)(?P<body>.*?)(?=\(\s*d\s*\)|Item\s*6\b|$)",
+    re.I | re.S,
+)
+
+
+def _item5c_transaction_dates(text: str) -> list[str]:
+    """Sorted unique YYYY-MM-DD dates mentioned in Schedule 13D Item 5(c).
+
+    Item 5(a)/(b) can run well past a few hundred characters, so scan each
+    "Item 5" heading's next 8000 characters for the "(c)" sub-item and take the
+    first that mentions any date.
+    """
+    for head in _ITEM5_HEAD_RE.finditer(text):
+        window = text[head.end(): head.end() + 8000]
+        m = _ITEM5C_BODY_RE.search(window)
+        if not m:
+            continue
+        body = m.group("body")[:4000]
+        found = {iso for iso in (_iso_date(x) for x in _DATE_TOKEN_RE.finditer(body)) if iso}
+        if found:
+            return sorted(found)
+    return []
+
+
+def event_date_for(parsed: dict, filing_date: str) -> str:
+    """Cover event date, else latest Item 5(c) transaction date, else ``filing_date``.
+
+    A candidate after ``filing_date`` is parser garbage and is ignored.
+    """
+    fd = str(filing_date or "")[:10]
+    candidates: list[str] = []
+    cover = parse_date_token(parsed.get("event_date"))
+    if cover:
+        candidates.append(cover)
+    tx = [d for d in (parsed.get("transaction_dates") or []) if d]
+    if tx:
+        candidates.append(max(tx))
+    for c in candidates:
+        if not fd or c <= fd:
+            return c
+        _log.warning("sec_13g: event_date %s after filing_date %s; using filing_date", c, fd)
+    return fd
 
 
 def forms_ok() -> set[str]:
@@ -129,6 +254,10 @@ def parse_13g_xml(xml_text: str) -> dict:
                 out["shares"] = float(re.sub(r"[^0-9.]", "", text))
             except (TypeError, ValueError):
                 pass
+        elif ("eventdate" in key or key == "dateofevent") and "event_date" not in out:
+            iso = parse_date_token(text)
+            if iso:
+                out["event_date"] = iso
     _apply_exit_flags(out)
     return out
 
@@ -202,6 +331,13 @@ def parse_13g_html(html_text: str) -> dict:
     if m:
         out["ticker"] = m.group("sym")
 
+    cover = _cover_event_date(text)
+    if cover:
+        out["event_date"] = cover
+    tx = _item5c_transaction_dates(text)
+    if tx:
+        out["transaction_dates"] = tx
+
     _apply_exit_flags(out, text)
     return out
 
@@ -262,7 +398,8 @@ def raw_to_live_row(
         except ValueError as e:
             _log.warning("sec_13g: skipping row (%s): %s", e, parsed)
             return None
-    note = f"source=13g form={form} cik={cik}"
+    event_date = event_date_for(parsed, filing_date)
+    note = f"source=13g form={form} cik={cik} event_date={event_date}"
     if ticker and str(ticker).startswith("PRIV_") and "ticker=private_note" not in note:
         note = f"{note}; ticker=private_note"
     return {
@@ -275,6 +412,7 @@ def raw_to_live_row(
         "carrying_usd": None,
         "market_value_usd": None,
         "as_of_date": filing_date,
+        "event_date": event_date,
         "as_of_accession_no": acc,
         "first_filing_date": filing_date,
         "first_accession_no": acc,
@@ -359,6 +497,7 @@ def raw_to_position(
         "note": note,
         "_source": "13g",
         "as_of_date": filing_date,
+        "event_date": live.get("event_date") or filing_date,
         "as_of_accession_no": acc,
     }
 
@@ -503,7 +642,15 @@ def collect_13g_period_snapshots(
     max_filings: int = 80,
     lookback_start: str | None = None,
 ) -> tuple[list[tuple[str, str, str, list[dict]]], dict[str, Any]]:
-    """Oldest→newest running issuer map from Schedule 13D/G amendments."""
+    """Oldest→newest running issuer map from Schedule 13D/G amendments.
+
+    Each tuple is ``(event_date, filing_date, accession, positions)``. Filings
+    are applied in ``(event_date, filing_date)`` order, where ``event_date`` is
+    the cover "Date of Event Which Requires Filing" (fallback: filing_date), so
+    a 13D filed inside the 45-day window after a quarter end sits in the
+    quarter its event belongs to. ``meta["exited_by_date"]`` is keyed the same
+    way.
+    """
     _key = holding_key
     from .lookback import date_on_or_after
 
@@ -529,12 +676,7 @@ def collect_13g_period_snapshots(
     items = list(reversed(items))
     meta["num_filings"] = len(items)
 
-    running: dict[str, dict] = {}
-    exited_tickers: set[str] = set()
-    exited_by_date: dict[str, list[str]] = {}
-    exit_events: dict[str, dict[str, str]] = {}
-    by_period: dict[str, tuple[str, str, str, list[dict]]] = {}
-
+    parsed_filings: list[tuple[str, str, str, dict]] = []
     for filing_date, form, acc, primary in items:
         time.sleep(0.08)
         body, kind = fetch_filing_text(session, cik, acc, primary)
@@ -554,6 +696,17 @@ def collect_13g_period_snapshots(
         )
         if not pos:
             continue
+        parsed_filings.append((str(pos.get("event_date") or filing_date)[:10], filing_date, acc, pos))
+
+    parsed_filings.sort(key=lambda t: (t[0], t[1]))
+
+    running: dict[str, dict] = {}
+    exited_tickers: set[str] = set()
+    exited_by_date: dict[str, list[str]] = {}
+    exit_events: dict[str, dict[str, str]] = {}
+    by_period: dict[str, tuple[str, str, str, list[dict]]] = {}
+
+    for event_date, filing_date, acc, pos in parsed_filings:
         pct = pos.get("ownership_pct")
         shares = pos.get("shares_held")
         note = str(pos.get("note") or "")
@@ -579,14 +732,15 @@ def collect_13g_period_snapshots(
                 exit_events[ticker] = {
                     "accession": acc,
                     "filing_date": filing_date,
+                    "event_date": event_date,
                 }
         else:
             running[k] = pos
             if ticker:
                 exited_tickers.discard(ticker)
-        exited_by_date[filing_date] = sorted(exited_tickers)
-        by_period[filing_date] = (
-            filing_date,
+        exited_by_date[event_date] = sorted(exited_tickers)
+        by_period[event_date] = (
+            event_date,
             filing_date,
             acc,
             [dict(v) for v in running.values()],
@@ -603,7 +757,11 @@ def exited_tickers_as_of(
     exited_by_date: dict[str, list[str]] | None,
     as_of: str,
 ) -> set[str]:
-    """Cumulative 13G/D exit tickers with filing_date <= as_of."""
+    """Cumulative 13G/D exit tickers whose event_date <= as_of.
+
+    ``exited_by_date`` comes from ``collect_13g_period_snapshots`` and is keyed
+    by event_date; pass a period_end to get the exits effective in that period.
+    """
     if not exited_by_date:
         return set()
     best: set[str] = set()
@@ -617,9 +775,21 @@ def exited_tickers_as_of(
 def positions_as_of(
     note_snaps: list[tuple[str, str, str, list[dict]]],
     as_of: str,
+    *,
+    by: str = "event",
 ) -> list[dict]:
-    """Latest running snapshot with filing_date <= as_of."""
-    eligible = [s for s in note_snaps if s[1] <= as_of]
+    """Latest running snapshot dated <= ``as_of``.
+
+    ``by="event"`` (default) compares the tuple's event_date (slot 0) — pass a
+    period_end so a 13D filed after the quarter closed but reporting an event
+    inside it lands in that quarter. ``by="filing"`` compares filing_date
+    (slot 1) for point-of-disclosure views.
+    """
+    if by not in {"event", "filing"}:
+        raise ValueError(f"positions_as_of: by must be 'event' or 'filing', got {by!r}")
+    slot = 0 if by == "event" else 1
+    as_of_s = str(as_of or "")[:10]
+    eligible = [s for s in note_snaps if str(s[slot] or "")[:10] <= as_of_s]
     if not eligible:
         return []
     return list(eligible[-1][3])
