@@ -589,6 +589,18 @@ def test_disclosed_lot_gives_exact_cost_and_partial_when_short():
     assert avg["cost_basis_status"] == "partial"
     assert "4,173,833 shares with no cost lot" in avg["cost_basis_note"]
     assert abs(avg["cost_px"] - 4.0) < 1e-9
+    # Disclosed lot stamped a quarter after the 13G buy row (real UBER/SERV
+    # shape): the unlotted count must still net it out.
+    late = [
+        {**disclosed[0], "acquired_period": "2024-06-30"}
+    ]
+    rows_late = SERV_ROWS[:2] + [
+        _row("2024-06-30", "SERV", "hold", 5_298_833.0, 5_298_833.0, 0.0, None, "source=13g"),
+        SERV_ROWS[2],
+        SERV_ROWS[3],
+    ]
+    _, real_late = build_lots_and_realized(rows_late, disclosed_lots=late)
+    assert "4,173,833 shares with no cost lot" in _by_method(real_late, "avg")[0]["cost_basis_note"]
     # A fully lotted position sells exact.
     clean = [
         _row("2024-06-30", "SERV", "new", 1_125_000.0, None, 1_125_000.0, None, "source=13g"),

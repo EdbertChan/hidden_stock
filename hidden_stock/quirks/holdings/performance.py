@@ -190,6 +190,9 @@ def build_lots_and_realized(
     unpriced_reason: dict[str, str] = {}
     # Shares held with no cost lot at all (13G-only / truncated buys). While any
     # remain, a sale can never be "exact": avg cost is over known lots only.
+    # Signed: disclosed lots subtract when opened (whichever period they land
+    # in), unpriced buys add; report max(0, ·). Ordering between the two is
+    # then irrelevant (13G buy rows can sit a quarter off the stated purchase).
     unlotted: dict[str, float] = defaultdict(float)
     pending_disclosed: dict[str, list[dict]] = defaultdict(list)
     for d in disclosed_lots or []:
@@ -211,6 +214,7 @@ def build_lots_and_realized(
                         "cost_source": "disclosed",
                     }
                 )
+                unlotted[t] -= d["shares"]
                 if d["acquired_period"] == pe:
                     opened_at_pe += d["shares"]
             else:
@@ -258,15 +262,18 @@ def build_lots_and_realized(
             # Lookback wall is not inception — do not invent a priced buy lot.
             if "lookback_truncated=1" in note or "cost_basis=unknown_truncated" in note:
                 unpriced_reason.setdefault(t, "lookback_truncated")
-                unlotted[t] += max(0.0, float(delta) - disclosed_here)
+                unlotted[t] += float(delta)
                 continue
             if px is None:
                 # 13G/D gives shares but no dollars; notes give dollars but no shares.
                 unpriced_reason.setdefault(
                     t, "13g_only_no_dollars" if "source=13g" in note else "no_period_price"
                 )
-                unlotted[t] += max(0.0, float(delta) - disclosed_here)
+                unlotted[t] += float(delta)
                 continue
+            # Disclosed lots opened this period replace part of the proxy lot;
+            # give back their unlotted credit since these shares were priced anyway.
+            unlotted[t] += disclosed_here
             remainder = float(delta) - disclosed_here
             if remainder > 1e-9:
                 lots[t].append(
@@ -327,12 +334,12 @@ def build_lots_and_realized(
                 f"lots cover {covered:,.0f} of {need:,.0f} shares; remainder "
                 f"{need - covered:,.0f} cost unknown ({_unknown_reason(t, row)})"
             )
-        elif unlotted[t] > 1e-6:
+        elif max(0.0, unlotted[t]) > 1e-6:
             # Sale is covered by known lots, but the position also holds shares
             # with no cost lot — which shares were sold is not knowable.
             status = COST_PARTIAL
             cb_note = (
-                f"position holds {unlotted[t]:,.0f} shares with no cost lot "
+                f"position holds {max(0.0, unlotted[t]):,.0f} shares with no cost lot "
                 f"({_unknown_reason(t, row)}); avg over known lots only"
             )
         if exit_px is None:
