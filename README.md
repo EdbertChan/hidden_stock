@@ -31,6 +31,19 @@ Grade an export (mechanical + optional LLM judges):
 uv run python scripts/grade_holdings_sheet.py --ticker <PARENT> --judges fable,codex
 ```
 
+## Git hooks
+
+Rule or principle edits on any agent-rule surface (`SKILL.md`, `*.mdc`, `.cursor/`, `.claude/`, `.codex/`, `CLAUDE.md`, `AGENTS.md`)
+must land with a code or test change in the same commit (CI checks the PR range too).
+Enable the local pre-commit check once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Explicit bypass, logged: `--allow-doc-only`, `SKILL_EDIT_ALLOW_DOC_ONLY=1`, or a
+`[doc-only]` tag in the commit message. See `scripts/check_skill_edit_has_code.py`.
+
 ## Layout
 
 | Path | Role |
