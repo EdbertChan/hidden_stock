@@ -1,0 +1,12 @@
+# Example hand-curated truths (copy to <parent>_anchors.yaml; that name is gitignored).
+# `scripts/reconcile_holdings.py --ticker <parent>` checks each anchor against the
+# exported history CSV and exits 1 on a mismatch. Values are filing-stated only.
+anchors:
+  - investee_ticker: EXAMPLE
+    period_end: "2026-06-30"
+    field: market_value_usd        # market_value_usd | shares_held | ownership_pct
+    expected_value: 1900000000     # sheet units (USD / shares / percent)
+    # expected_musd: 1900          # shorthand for market_value_usd in $ millions
+    tolerance_pct: 0               # optional, default exact
+    source_url: https://www.sec.gov/Archives/edgar/data/<cik>/<accession-nodash>/<doc>.htm
+    quote: "Example Co. 1,900"     # optional; checked verbatim in source_url text
