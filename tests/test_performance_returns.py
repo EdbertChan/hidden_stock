@@ -8,6 +8,7 @@ import pytest
 from hidden_stock.quirks.holdings.performance import (
     assert_mtm_identity,
     build_lots_and_realized,
+    realized_events_frame,
     holding_period_returns,
     linked_dietz_cagr,
     load_reported_investment_income,
@@ -262,7 +263,12 @@ def test_missing_price_row_excluded_no_crash():
     assert abs(port.iloc[0]["portfolio_mv_end"] - 100.0) < 1e-9
     assert abs(port.iloc[1]["portfolio_mv_end"] - 120.0) < 1e-9
     real = frames["realized_pnl_qoq"]
-    assert len(real) == 0 or "SERV" not in set(real["investee_ticker"].tolist())
+    # A sale with no cost lot is never dropped: it ships as cost_basis_status=unknown.
+    serv = real[real["investee_ticker"] == "SERV"]
+    assert len(serv) == 1
+    assert serv.iloc[0]["cost_basis_status"] == "unknown"
+    assert serv.iloc[0]["cost_px"] is None or pd.isna(serv.iloc[0]["cost_px"])
+    assert pd.isna(serv.iloc[0]["realized_pnl_est"])
 
 
 def test_holding_returns_weight_and_contribution():
@@ -536,3 +542,108 @@ def test_realized_chart_frames_empty_safe():
         "investee_ticker",
         "realized_pnl_m",
     ]
+
+def _row(pe, t, action, held, prev, delta, mv, note=""):
+    return {
+        "period_end": pe,
+        "investee_ticker": t,
+        "investee_name": t,
+        "action": action,
+        "shares_held": held,
+        "shares_prev": prev,
+        "shares_delta": delta,
+        "market_value_usd": mv,
+        "note": note,
+    }
+
+
+# UBER × SERV shape: 13G buys carry shares but no dollars; the 13F later shows a sell.
+SERV_ROWS = [
+    _row("2023-09-30", "SERV", "new", 3_963_808.0, None, 3_963_808.0, None, "source=13g form=SC 13G"),
+    _row("2023-12-31", "SERV", "buy", 5_298_833.0, 3_963_808.0, 1_335_025.0, None, "source=13g form=SC 13D"),
+    _row("2024-12-31", "SERV", "hold", 5_298_833.0, 5_298_833.0, 0.0, 71_534_246.0, "source=sec_api_13f"),
+    _row("2025-03-31", "SERV", "sell", 4_748_833.0, 5_298_833.0, -550_000.0, 27_305_790.0, "source=sec_api_13f"),
+]
+
+
+def test_13g_only_buys_sell_is_explicit_unknown_not_dropped():
+    _, realized = build_lots_and_realized(SERV_ROWS)
+    assert len(realized) == 1
+    ev = realized[0]
+    assert ev["cost_method"] == "avg"
+    assert ev["cost_basis_status"] == "unknown"
+    assert "13g_only_no_dollars" in ev["cost_basis_note"]
+    assert ev["cost_px"] is None and ev["realized_pnl_est"] is None
+    assert ev["shares_sold"] == 550_000.0
+    assert abs(ev["exit_px"] - 27_305_790.0 / 4_748_833.0) < 1e-9
+
+
+def test_disclosed_lot_gives_exact_cost_and_partial_when_short():
+    disclosed = [
+        {"investee_ticker": "SERV", "acquired_period": "2023-12-31", "shares": 1_125_000.0, "cost_px": 4.0}
+    ]
+    _, realized = build_lots_and_realized(SERV_ROWS, disclosed_lots=disclosed)
+    avg = _by_method(realized, "avg")[0]
+    # 550k sold, 1.125M disclosed at $4.00 covers it — but 4.17M other shares
+    # have no lot, so which shares were sold is unknowable: partial, not exact.
+    assert avg["cost_basis_status"] == "partial"
+    assert "4,173,833 shares with no cost lot" in avg["cost_basis_note"]
+    assert abs(avg["cost_px"] - 4.0) < 1e-9
+    # A fully lotted position sells exact.
+    clean = [
+        _row("2024-06-30", "SERV", "new", 1_125_000.0, None, 1_125_000.0, None, "source=13g"),
+        _row("2025-03-31", "SERV", "sell", 575_000.0, 1_125_000.0, -550_000.0, 3_306_250.0, "source=sec_api_13f"),
+    ]
+    _, clean_real = build_lots_and_realized(clean, disclosed_lots=[{**disclosed[0], "acquired_period": "2024-06-30"}])
+    assert _by_method(clean_real, "avg")[0]["cost_basis_status"] == "exact"
+    exit_px = 27_305_790.0 / 4_748_833.0
+    assert abs(avg["realized_pnl_est"] - 550_000.0 * (exit_px - 4.0)) < 1e-6
+    # Sell more than the disclosed lot: partial, with the shortfall spelled out.
+    big = SERV_ROWS[:3] + [
+        _row("2025-03-31", "SERV", "sell", 3_000_000.0, 5_298_833.0, -2_298_833.0, 17_250_000.0, "source=sec_api_13f")
+    ]
+    _, realized2 = build_lots_and_realized(big, disclosed_lots=disclosed)
+    avg2 = _by_method(realized2, "avg")[0]
+    assert avg2["cost_basis_status"] == "partial"
+    assert "1,125,000 of 2,298,833" in avg2["cost_basis_note"]
+    fifo2 = _by_method(realized2, "fifo")
+    assert [f["cost_basis_status"] for f in fifo2] == ["exact", "unknown"]
+    assert abs(fifo2[1]["shares_sold"] - (2_298_833.0 - 1_125_000.0)) < 1e-6
+
+
+def test_priced_lots_are_estimated_and_frame_has_status_columns():
+    rows = [
+        _row("2024-03-31", "ABC", "new", 100.0, 0.0, 100.0, 1000.0, "source=sec_api_13f"),
+        _row("2024-06-30", "ABC", "sell", 40.0, 100.0, -60.0, 600.0, "source=sec_api_13f"),
+    ]
+    _, realized = build_lots_and_realized(rows)
+    assert {e["cost_basis_status"] for e in realized} == {"estimated"}
+    df = realized_events_frame(realized)
+    cols = list(df.columns)
+    assert cols.index("cost_basis_status") == cols.index("cost_method") + 1
+    assert "cost_basis_note" in cols
+
+
+def test_load_disclosed_cost_basis_yaml(tmp_path, monkeypatch):
+    import hidden_stock.quirks.holdings.performance as perf
+
+    (tmp_path / "uber_cost_basis.yaml").write_text(
+        """
+lots:
+  - investee_ticker: SERV
+    acquired_period: "2024-06-30"
+    shares: 1125000
+    cost_px: 4.00
+    source_url: https://www.sec.gov/Archives/edgar/data/1543151/000155278124000296/e24231_uberserv-sc13d.htm
+    note: "April 2024 public offering, Item 5(c) of SC 13D filed 2024-05-08"
+  - investee_ticker: XYZ
+    acquired_period: "2024-06-30"
+    shares: 10
+    total_cost_usd: 55
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(perf, "_DATA_DIR", tmp_path)
+    lots = perf.load_disclosed_cost_basis("uber")
+    assert [(l["investee_ticker"], l["shares"], l["cost_px"]) for l in lots] == [("SERV", 1125000.0, 4.0), ("XYZ", 10.0, 5.5)]
+    assert perf.load_disclosed_cost_basis("NOPE") == []

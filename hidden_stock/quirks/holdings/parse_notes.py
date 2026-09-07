@@ -297,21 +297,33 @@ def parse_investments_table(
     prose = strip_xbrl_member_soup(text)
     prose = html_lib.unescape(re.sub(r"<[^>]+>", " ", prose))
     prose = re.sub(r"\s+", " ", prose)
-    dm = _AS_OF_DATES_RE.search(prose) or _AS_OF_YEAR_PAIR_RE.search(prose)
-    if not dm:
-        return []
-    date_a, date_b = find_as_of_dates(prose[dm.start() : dm.end()])  # type: ignore[misc]
-    # Restrict search window after the As-of header
-    window = prose[dm.start() : dm.start() + 4000]
-    for rm in _INVESTMENTS_ROW_RE.finditer(window):
-        add_pair(
-            rm.group("name"),
-            date_a,
-            _millions_to_usd(rm.group("a")),
-            date_b,
-            _millions_to_usd(rm.group("b")),
-            rm.group(0),
-        )
+    # The plain-text path is what production sees (collect_note_snapshots hands
+    # the parser get_filing_text output, tables already flattened). A 10-K has
+    # many "Month d, yyyy Month d, yyyy" headers before the Investments table,
+    # so try every header and keep the first window that yields investee rows.
+    headers = sorted(
+        [m.start() for m in _AS_OF_DATES_RE.finditer(prose)]
+        + [m.start() for m in _AS_OF_YEAR_PAIR_RE.finditer(prose)]
+    )
+    for start in headers:
+        dates = find_as_of_dates(prose[start : start + 80])
+        if not dates:
+            continue
+        date_a, date_b = dates
+        window = prose[start : start + 4000]
+        found = False
+        for rm in _INVESTMENTS_ROW_RE.finditer(window):
+            add_pair(
+                rm.group("name"),
+                date_a,
+                _millions_to_usd(rm.group("a")),
+                date_b,
+                _millions_to_usd(rm.group("b")),
+                rm.group(0),
+            )
+            found = True
+        if found and rows_out:
+            return rows_out
     return rows_out
 
 

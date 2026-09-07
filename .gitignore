@@ -39,3 +39,6 @@ backtest_report_data.json
 .vscode/
 
 .claude/
+
+# Curated per-parent cost lots (stock-specific; keep local)
+**/data/*_cost_basis.yaml

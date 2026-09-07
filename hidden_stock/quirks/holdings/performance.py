@@ -104,12 +104,77 @@ def _oldest_open(lots: deque) -> str | None:
     return str(lots[0].get("open_period") or "") or None
 
 
+# cost_basis_status values on realized_pnl_qoq rows. A sale is never dropped:
+# when cost is not knowable the row still ships with null cost / P&L.
+COST_EXACT = "exact"          # every lot from a disclosed consideration (curated YAML)
+COST_ESTIMATED = "estimated"  # every lot priced at period-end MV / shares (proxy)
+COST_MIXED = "mixed"          # disclosed + proxy lots consumed
+COST_PARTIAL = "partial"      # lots cover only part of the shares sold
+COST_UNKNOWN = "unknown"      # no lot at all (13G-only buys, truncated lookback)
+
+
+def load_disclosed_cost_basis(parent: str | None) -> list[dict]:
+    """Curated disclosed lots: ``data/<parent>_cost_basis.yaml``.
+
+    Entries: investee_ticker, acquired_period (YYYY-MM-DD period_end), shares,
+    cost_px or total_cost_usd, source_url, note. Only a filing-stated
+    consideration (13D Item 3/5, 8-K, offering price) belongs here.
+    """
+    if not parent:
+        return []
+    key = normalize_ticker(parent) or str(parent or "").strip().upper()
+    path = _DATA_DIR / f"{key.lower()}_cost_basis.yaml"
+    if not path.is_file():
+        return []
+    import yaml
+
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    out: list[dict] = []
+    for e in raw.get("lots") or []:
+        t = normalize_ticker(e.get("investee_ticker"))
+        shares = _f(e.get("shares"))
+        px = _f(e.get("cost_px"))
+        total = _f(e.get("total_cost_usd"))
+        if px is None and total is not None and shares:
+            px = total / shares
+        if not t or not shares or shares <= 0 or px is None:
+            continue
+        out.append(
+            {
+                "investee_ticker": t,
+                "acquired_period": str(e.get("acquired_period") or "")[:10],
+                "shares": float(shares),
+                "cost_px": float(px),
+                "source_url": e.get("source_url"),
+                "note": e.get("note"),
+            }
+        )
+    return out
+
+
+def _lots_status(consumed: list[dict]) -> str:
+    srcs = {str(l.get("cost_source") or "proxy") for l in consumed}
+    if srcs == {"disclosed"}:
+        return COST_EXACT
+    if srcs == {"proxy"}:
+        return COST_ESTIMATED
+    return COST_MIXED
+
+
 def build_lots_and_realized(
     history_rows: list[dict],
+    *,
+    disclosed_lots: list[dict] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Open lots on buys; on sells emit avg-cost (primary) + FIFO (sensitivity) events.
 
-    Returns (unused_open_lots, realized_events) where each event has cost_method=avg|fifo.
+    Every sell/exit row produces at least one realized event. When no cost lot
+    exists (13G-only buys carry shares but no dollars; lookback truncation) the
+    event ships with ``cost_px``/``realized_pnl_est`` null and
+    ``cost_basis_status=unknown`` plus the reason — never silently dropped.
+
+    Returns (unused_open_lots, realized_events); each event has
+    cost_method=avg|fifo and cost_basis_status.
     """
     rows = sorted(
         history_rows,
@@ -121,6 +186,43 @@ def build_lots_and_realized(
     )
     lots: dict[str, deque] = defaultdict(deque)
     realized: list[dict] = []
+    # Why a ticker has no priced lot (first reason wins; reported on unknown rows).
+    unpriced_reason: dict[str, str] = {}
+    # Shares held with no cost lot at all (13G-only / truncated buys). While any
+    # remain, a sale can never be "exact": avg cost is over known lots only.
+    unlotted: dict[str, float] = defaultdict(float)
+    pending_disclosed: dict[str, list[dict]] = defaultdict(list)
+    for d in disclosed_lots or []:
+        pending_disclosed[d["investee_ticker"]].append(dict(d))
+    for t in pending_disclosed:
+        pending_disclosed[t].sort(key=lambda d: d["acquired_period"])
+
+    def _flush_disclosed(t: str, pe: str) -> float:
+        """Open disclosed lots for ticker t with acquired_period <= pe; return shares opened at pe."""
+        opened_at_pe = 0.0
+        keep: list[dict] = []
+        for d in pending_disclosed.get(t, []):
+            if d["acquired_period"] <= pe:
+                lots[t].append(
+                    {
+                        "shares": d["shares"],
+                        "cost_px": d["cost_px"],
+                        "open_period": d["acquired_period"],
+                        "cost_source": "disclosed",
+                    }
+                )
+                if d["acquired_period"] == pe:
+                    opened_at_pe += d["shares"]
+            else:
+                keep.append(d)
+        pending_disclosed[t] = keep
+        return opened_at_pe
+
+    def _unknown_reason(t: str, row: dict) -> str:
+        note = str(row.get("note") or "")
+        if "lookback_truncated=1" in note or "cost_basis=unknown_truncated" in note:
+            return "lookback_truncated"
+        return unpriced_reason.get(t, "no_priced_lot")
 
     for row in rows:
         t = _ticker_key(row)
@@ -130,6 +232,7 @@ def build_lots_and_realized(
         px = period_price(row)
         pe = str(row.get("period_end") or "")
         action = str(row.get("action") or "")
+        note = str(row.get("note") or "")
 
         # ADS ratio / reverse-split: rescale open lots; never book a disposal.
         if action == "ratio_adj":
@@ -149,66 +252,105 @@ def build_lots_and_realized(
                         lot["cost_px"] = float(lot["cost_px"]) * factor
             continue
 
-        if delta > 0 and px is not None:
-            note = str(row.get("note") or "")
+        disclosed_here = _flush_disclosed(t, pe)
+
+        if delta > 0:
             # Lookback wall is not inception — do not invent a priced buy lot.
             if "lookback_truncated=1" in note or "cost_basis=unknown_truncated" in note:
+                unpriced_reason.setdefault(t, "lookback_truncated")
+                unlotted[t] += max(0.0, float(delta) - disclosed_here)
                 continue
-            lots[t].append(
-                {
-                    "shares": float(delta),
-                    "cost_px": float(px),
-                    "open_period": pe,
-                }
-            )
-            continue
-
-        if delta >= 0 or px is None:
-            continue
-
-        need = -float(delta)
-        exit_px = float(px)
-        if need <= 1e-12:
-            continue
-        if not lots[t]:
-            # Exit with no known lots (truncated open) — do not invent cost.
-            if "lookback_truncated=1" in str(row.get("note") or ""):
-                realized.append(
+            if px is None:
+                # 13G/D gives shares but no dollars; notes give dollars but no shares.
+                unpriced_reason.setdefault(
+                    t, "13g_only_no_dollars" if "source=13g" in note else "no_period_price"
+                )
+                unlotted[t] += max(0.0, float(delta) - disclosed_here)
+                continue
+            remainder = float(delta) - disclosed_here
+            if remainder > 1e-9:
+                lots[t].append(
                     {
-                        "period_end": pe,
-                        "investee_ticker": t,
-                        "investee_name": row.get("investee_name"),
-                        "shares_sold": need,
-                        "cost_px": None,
-                        "exit_px": exit_px,
-                        "realized_pnl_est": None,
-                        "cost_method": "avg",
-                        "lot_opened_period": None,
-                        "holding_periods": None,
-                        "filing_url": row.get("filing_url"),
-                        "accession_no": row.get("accession_no"),
-                        "note": f"{NOTE_EST}; cost_basis=unknown_truncated",
+                        "shares": remainder,
+                        "cost_px": float(px),
+                        "open_period": pe,
+                        "cost_source": "proxy",
                     }
                 )
             continue
 
+        if delta >= 0:
+            continue
+
+        need = -float(delta)
+        if need <= 1e-12:
+            continue
+        exit_px = float(px) if px is not None else None
+        base = {
+            "period_end": pe,
+            "investee_ticker": t,
+            "investee_name": row.get("investee_name"),
+            "exit_px": exit_px,
+            "filing_url": row.get("filing_url"),
+            "accession_no": row.get("accession_no"),
+        }
+
+        if not lots[t]:
+            reason = _unknown_reason(t, row)
+            unlotted[t] = max(0.0, unlotted[t] - need)
+            legacy = "; cost_basis=unknown_truncated" if reason == "lookback_truncated" else ""
+            realized.append(
+                {
+                    **base,
+                    "shares_sold": need,
+                    "cost_px": None,
+                    "realized_pnl_est": None,
+                    "cost_method": "avg",
+                    "cost_basis_status": COST_UNKNOWN,
+                    "cost_basis_note": f"no cost lot: {reason}",
+                    "lot_opened_period": None,
+                    "holding_periods": None,
+                    "note": f"{NOTE_EST}{legacy}",
+                }
+            )
+            continue
+
+        available = sum(float(l["shares"]) for l in lots[t])
+        covered = min(need, available)
         avg_px = _avg_cost_px(lots[t])
         oldest = _oldest_open(lots[t])
+        status = _lots_status(list(lots[t]))
+        cb_note = ""
+        if available + 1e-9 < need:
+            status = COST_PARTIAL
+            cb_note = (
+                f"lots cover {covered:,.0f} of {need:,.0f} shares; remainder "
+                f"{need - covered:,.0f} cost unknown ({_unknown_reason(t, row)})"
+            )
+        elif unlotted[t] > 1e-6:
+            # Sale is covered by known lots, but the position also holds shares
+            # with no cost lot — which shares were sold is not knowable.
+            status = COST_PARTIAL
+            cb_note = (
+                f"position holds {unlotted[t]:,.0f} shares with no cost lot "
+                f"({_unknown_reason(t, row)}); avg over known lots only"
+            )
+        if exit_px is None:
+            cb_note = (cb_note + "; " if cb_note else "") + "exit_px unknown (no period $)"
         if avg_px is not None:
             realized.append(
                 {
-                    "period_end": pe,
-                    "investee_ticker": t,
-                    "investee_name": row.get("investee_name"),
+                    **base,
                     "shares_sold": need,
                     "cost_px": avg_px,
-                    "exit_px": exit_px,
-                    "realized_pnl_est": need * (exit_px - avg_px),
+                    "realized_pnl_est": (
+                        covered * (exit_px - avg_px) if exit_px is not None else None
+                    ),
                     "cost_method": "avg",
+                    "cost_basis_status": status,
+                    "cost_basis_note": cb_note,
                     "lot_opened_period": oldest,
                     "holding_periods": _holding_periods(oldest or pe, pe),
-                    "filing_url": row.get("filing_url"),
-                    "accession_no": row.get("accession_no"),
                     "note": NOTE_EST,
                 }
             )
@@ -220,18 +362,19 @@ def build_lots_and_realized(
             take = min(lot["shares"], remaining)
             realized.append(
                 {
-                    "period_end": pe,
-                    "investee_ticker": t,
-                    "investee_name": row.get("investee_name"),
+                    **base,
                     "shares_sold": take,
                     "cost_px": lot["cost_px"],
-                    "exit_px": exit_px,
-                    "realized_pnl_est": take * (exit_px - lot["cost_px"]),
+                    "realized_pnl_est": (
+                        take * (exit_px - lot["cost_px"]) if exit_px is not None else None
+                    ),
                     "cost_method": "fifo",
+                    "cost_basis_status": _lots_status([lot]),
+                    "cost_basis_note": (
+                        "exit_px unknown (no period $)" if exit_px is None else ""
+                    ),
                     "lot_opened_period": lot["open_period"],
                     "holding_periods": _holding_periods(lot["open_period"], pe),
-                    "filing_url": row.get("filing_url"),
-                    "accession_no": row.get("accession_no"),
                     "note": NOTE_EST,
                 }
             )
@@ -239,6 +382,22 @@ def build_lots_and_realized(
             remaining -= take
             if lot["shares"] <= 1e-12:
                 lots[t].popleft()
+        if remaining > 1e-6:
+            unlotted[t] = max(0.0, unlotted[t] - remaining)
+            realized.append(
+                {
+                    **base,
+                    "shares_sold": remaining,
+                    "cost_px": None,
+                    "realized_pnl_est": None,
+                    "cost_method": "fifo",
+                    "cost_basis_status": COST_UNKNOWN,
+                    "cost_basis_note": f"no cost lot for remainder: {_unknown_reason(t, row)}",
+                    "lot_opened_period": None,
+                    "holding_periods": None,
+                    "note": NOTE_EST,
+                }
+            )
 
     return [], realized
 
@@ -666,6 +825,8 @@ def realized_events_frame(realized_events: list[dict]) -> pd.DataFrame:
         "exit_px",
         "realized_pnl_est",
         "cost_method",
+        "cost_basis_status",
+        "cost_basis_note",
         "holding_periods",
         "lot_opened_period",
         "filing_url",
@@ -955,7 +1116,9 @@ def performance_frames(
         rows = hist.to_dict(orient="records") if len(hist) else []
     else:
         rows = list(hist or [])
-    _, realized = build_lots_and_realized(rows)
+    _, realized = build_lots_and_realized(
+        rows, disclosed_lots=load_disclosed_cost_basis(parent)
+    )
     returns = period_portfolio_returns(rows, realized)
     realized_df = realized_events_frame(realized)
     frames = {

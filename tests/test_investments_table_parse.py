@@ -57,3 +57,24 @@ def test_10k_year_pair_header_parses():
     assert all(r["_source"] == "10k_investments_table" for r in rows)
 
 
+
+
+# Production hands the parser flattened text (tables gone). A 10-K has other
+# two-date headers long before the Investments table; the first one used to
+# win and the 10-K yielded zero rows for every Uber annual filing.
+UBER_10K_PLAIN = (
+    "Consolidated Balance Sheets As of December 31, 2024 December 31, 2025 "
+    "Cash and cash equivalents $ 6,000 $ 7,000 Total assets 50,000 60,000 "
+    + "x " * 2500
+    + "Note 2 – Investments and Fair Value Measurement Investments Our investments "
+    "on the consolidated balance sheets consisted of the following as of December 31, "
+    "2024 and 2025 (in millions): As of December 31, 2024 2025 Classified as investments: "
+    "Non-marketable equity securities: Didi $ 2,602 $ 3,011 Other (2) 608 1,455 "
+    "Marketable equity securities: Grab 2,529 2,674 Aurora (3) 2,054 1,252 "
+)
+
+
+def test_10k_plain_text_skips_earlier_headers():
+    rows = parse_investments_table(UBER_10K_PLAIN, parent_ticker="UBER", form="10-K", filing_date="2026-02-13")
+    assert _fv(rows, "DIDIY", "2025-12-31") == 3_011_000_000.0
+    assert _fv(rows, "AUR", "2024-12-31") == 2_054_000_000.0
