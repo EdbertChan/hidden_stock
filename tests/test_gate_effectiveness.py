@@ -680,7 +680,9 @@ def _empty_export_unexplained():
         assert status["note"].iloc[0] == note and int(status["num_13g_self_issuer_filings"].iloc[0]) == 1
         res = precheck(ctx.grade, explained)
         assert res["checks"]["empty_export_explained"] == "pass"
+        assert res["checks"]["no_self_issuer_row"] == "pass", "zero rows must resolve, not stay unknown"
         assert "empty_export_unexplained" not in _issue_ids(res)
+        assert meta["num_self_issuer_dropped"] == 0
         assert "empty_export_unexplained" not in run_grade(ctx.grade, explained)[3]
 
         paths = write_csvs(PARENT, empty_hold, empty_hist, explained)

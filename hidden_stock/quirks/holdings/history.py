@@ -1079,6 +1079,7 @@ def build_holdings_history(
     cik = PARENT_CIK_OVERRIDES.get(parent) or edgar.get_cik(parent)
     hints = parent_name_hints_for(parent, edgar=edgar, cik=cik)
     start = lookback_start_date(as_of=as_of, lookback_years=lookback_years)
+    meta_defaults = {"num_13g_self_issuer_filings": 0, "num_self_issuer_dropped": 0}
     if max_annual_filings is None:
         # lookback_years=0 means the whole book: do not cap notes at 3 years.
         max_annual_filings = 400 if int(lookback_years) <= 0 else max(12, int(lookback_years) * 4)
@@ -1097,6 +1098,8 @@ def build_holdings_history(
         meta["strategy"] = strategy
         meta["lookback_start"] = start
         meta["lookback_years"] = lookback_years
+        for k, v in meta_defaults.items():
+            meta.setdefault(k, v)
         hist = _without_self_issuer_rows(hist, parent, hints, meta)
         return stamp_filing_urls(price_history_rows(hist), cik=cik), meta
 
@@ -1107,6 +1110,8 @@ def build_holdings_history(
         max_filings=max_filings,
         lookback_start=start,
     )
+    for k, v in meta_defaults.items():
+        meta.setdefault(k, v)
     meta["strategy"] = strategy
     meta["lookback_start"] = start
     meta["lookback_years"] = lookback_years

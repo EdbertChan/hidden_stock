@@ -552,7 +552,7 @@ def mechanical_precheck(
             checks["no_blank_public_ticker"] = "pass"
 
     checks.setdefault("no_self_issuer_row", "unknown")
-    if "investee_ticker" in hist.columns or "investee_name" in hist.columns:
+    if len(hist) == 0 or "investee_ticker" in hist.columns or "investee_name" in hist.columns:
         from hidden_stock.quirks.holdings.validate import self_issuer_row_reason
 
         hints = list(parent_name_hints or [])
