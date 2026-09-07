@@ -453,9 +453,15 @@ def _flows_by_period_ticker(
     return it in ``series_breaks`` so callers reset the linked Dietz segment.
     """
     flows: dict[tuple[str, str], float] = defaultdict(float)
-    share_based: set[str] = set()
+    # Share-based is a property of the row, not the ticker: a name disclosed
+    # as dollars-only for years (10-Q Investments table) and counted later
+    # (13G/13F) is MV-only in the early periods, so its first appearance must
+    # book a coverage flow — otherwise the whole stake reads as MTM gain.
+    share_based_pe: set[tuple[str, str]] = set()
+    mv_only_seen: set[str] = set()
     mv_tt: dict[tuple[str, str], float] = {}
-    for r in history_rows:
+    ordered = sorted(history_rows, key=lambda r: str(r.get("period_end") or ""))
+    for r in ordered:
         t = _ticker_key(r)
         pe = str(r.get("period_end") or "")
         if not t or not pe:
@@ -471,12 +477,25 @@ def _flows_by_period_ticker(
             continue  # share restatement, not cash/share flow
         sh = _f(r.get("shares_held"))
         sp = _f(r.get("shares_prev"))
-        if (sh is not None and sh > 0) or (sp is not None and sp > 0):
-            share_based.add(t)
+        has_shares = (sh is not None and sh > 0) or (sp is not None and sp > 0)
+        if has_shares:
+            share_based_pe.add((pe, t))
         if str(r.get("action") or "") != "exit":
             mv = _f(r.get("market_value_usd"))
             if mv is not None:
                 mv_tt[(pe, t)] = mv_tt.get((pe, t), 0.0) + float(mv)
+        # First share count on a name already carried MV-only is a disclosure
+        # upgrade, not a purchase (mirrors _classify_units "hold" on %→count).
+        if (
+            has_shares
+            and t in mv_only_seen
+            and _f(r.get("shares_delta")) is None
+            and (sp is None or sp <= 0)
+        ):
+            mv_only_seen.discard(t)
+            continue
+        if not has_shares and _f(r.get("market_value_usd")) is not None:
+            mv_only_seen.add(t)
         delta = _share_delta(r)
         px = period_price(r)
         if px is None or abs(delta) < 1e-12:
@@ -488,12 +507,15 @@ def _flows_by_period_ticker(
     prev_tickers: set[str] = set()
     prev_mv: dict[str, float] = {}
     series_breaks: set[str] = set()
+    prev_pe: str | None = None
     for pe in periods:
         cur_mv = {t: mv for (p, t), mv in mv_tt.items() if p == pe}
         cur_tickers = set(cur_mv)
-        appearing = {t for t in cur_tickers - prev_tickers if t not in share_based}
+        appearing = {t for t in cur_tickers - prev_tickers if (pe, t) not in share_based_pe}
         disappearing = {
-            t for t in prev_tickers - cur_tickers if t not in share_based
+            t
+            for t in prev_tickers - cur_tickers
+            if prev_pe is None or (prev_pe, t) not in share_based_pe
         }
         if appearing and disappearing:
             # Basis/disclosure switch (associates FV → all-listed investees FV).
@@ -505,6 +527,7 @@ def _flows_by_period_ticker(
                 flows[(pe, t)] -= float(prev_mv.get(t, 0.0))
         prev_tickers = cur_tickers
         prev_mv = cur_mv
+        prev_pe = pe
     return dict(flows), series_breaks
 
 

@@ -78,3 +78,17 @@ def test_10k_plain_text_skips_earlier_headers():
     rows = parse_investments_table(UBER_10K_PLAIN, parent_ticker="UBER", form="10-K", filing_date="2026-02-13")
     assert _fv(rows, "DIDIY", "2025-12-31") == 3_011_000_000.0
     assert _fv(rows, "AUR", "2024-12-31") == 2_054_000_000.0
+
+
+# FY2019 10-K narrative: "As of December 31, 2017 June 30, 2018 ... Didi, $501 million
+# gain". "[\d,]+" matched the bare comma after Didi, so a $501M Didi "FV" row
+# appeared at 2018-06-30 and blew up the first Dietz period.
+NARRATIVE_NOT_A_ROW = (
+    "Balances As of December 31, 2017 June 30, 2018 Restricted cash 1,000 1,200 "
+    "During the period we recognized an unrealized gain on our investment in "
+    "Didi, $501 million, and other gains of $20 million."
+)
+
+
+def test_narrative_comma_amount_is_not_a_row():
+    assert parse_investments_table(NARRATIVE_NOT_A_ROW, parent_ticker="UBER", form="10-K") == []

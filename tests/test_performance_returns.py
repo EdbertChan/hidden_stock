@@ -659,3 +659,34 @@ lots:
     lots = perf.load_disclosed_cost_basis("uber")
     assert [(l["investee_ticker"], l["shares"], l["cost_px"]) for l in lots] == [("SERV", 1125000.0, 4.0), ("XYZ", 10.0, 5.5)]
     assert perf.load_disclosed_cost_basis("NOPE") == []
+
+
+# UBER pre-13F shape: names carried as 10-Q dollars only, counted years later.
+MV_ONLY_THEN_COUNTED = [
+    _row("2018-12-31", "DIDIY", "new", None, None, None, 7.953e9, "source=10q_investments_table"),
+    _row("2018-12-31", "GRAB", "new", None, None, None, 2.328e9, "source=10q_investments_table"),
+    _row("2019-03-31", "DIDIY", "hold", None, None, None, 7.953e9, "source=10q_investments_table"),
+    _row("2019-03-31", "GRAB", "hold", None, None, None, 2.324e9, "source=10q_investments_table"),
+    _row("2019-06-30", "DIDIY", "hold", None, None, None, 7.953e9, "source=10q_investments_table"),
+    _row("2019-06-30", "GRAB", "hold", None, None, None, 2.334e9, "source=10q_investments_table"),
+    _row("2019-06-30", "AUR", "new", None, None, None, 1.677e9, "source=10q_investments_table"),
+    # First share count on an already-held name: disclosure upgrade, not a buy.
+    _row("2019-09-30", "DIDIY", "hold", 143_911_749.0, None, None, 7.953e9, "source=13g; source=10q_investments_table"),
+    _row("2019-09-30", "GRAB", "hold", None, None, None, 2.332e9, "source=10q_investments_table"),
+    _row("2019-09-30", "AUR", "hold", None, None, None, 1.7e9, "source=10q_investments_table"),
+]
+
+
+def test_mv_only_appearance_is_flow_not_mtm_even_if_counted_later():
+    frames = performance_frames(MV_ONLY_THEN_COUNTED)
+    r = frames["returns_by_period"].set_index("period_end")
+    # 2019-03-31: no names appear; pure MTM of -4M on Didi/Grab.
+    assert abs(r.loc["2019-03-31", "net_external_flow"]) < 1.0
+    assert abs(r.loc["2019-03-31", "mtm_pnl"] - (-4e6)) < 1.0
+    assert abs(r.loc["2019-03-31", "dietz_return"]) < 0.001
+    # 2019-06-30: AUR appears MV-only → +1.677B external flow, not gain.
+    assert abs(r.loc["2019-06-30", "net_external_flow"] - 1.677e9) < 1.0
+    assert abs(r.loc["2019-06-30", "mtm_pnl"] - 10e6) < 1.0
+    # 2019-09-30: Didi gets a share count with no delta → no phantom $7.95B buy.
+    assert abs(r.loc["2019-09-30", "net_external_flow"]) < 1.0
+    assert abs(r.loc["2019-09-30", "dietz_return"]) < 0.01

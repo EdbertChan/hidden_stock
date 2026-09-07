@@ -57,7 +57,9 @@ _AS_OF_DATES_RE = re.compile(
 
 # Two-column table row: each cell is a number or an em/en dash (nil). A number
 # token must end at a non-digit so "2,838 —" cannot backtrack into "2,83" + "8".
-_NUM_OR_DASH = r"(?:[\d,]+(?:\.\d+)?(?![\d,])|[—–-])"
+# A number must start with a digit: "[\d,]+" accepted a bare comma, so the
+# narrative "Didi, $501 million gain" parsed as a Didi FV row of $501M.
+_NUM_OR_DASH = r"(?:\d[\d,]*(?:\.\d+)?(?![\d,])|[—–-])"
 _INVESTMENTS_ROW_RE = re.compile(
     r"(?P<name>Didi|Grab|Aurora|Delivery\s+Hero|Recursion)"
     r"(?:\s*\([^)]*\))?"
