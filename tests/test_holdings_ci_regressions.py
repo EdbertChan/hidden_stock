@@ -10,7 +10,9 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import pytest
 
+from helpers import INPUT_SHAPES, shaped
 from hidden_stock.quirks.holdings.export import chart_data_frame, portfolio_by_period_frame
 from hidden_stock.quirks.holdings.history import (
     _merge_period_rows,
@@ -106,9 +108,10 @@ def test_ci_didi_html_and_self_issuer_filter():
     )
 
 
-def test_ci_investments_table_didi_1900m():
+@pytest.mark.parametrize("shape", INPUT_SHAPES)
+def test_ci_investments_table_didi_1900m(shape):
     rows = parse_investments_table(
-        UBER_INVESTMENTS_TABLE, parent_ticker="UBER", form="10-Q", filing_date="2026-08-06"
+        shaped(UBER_INVESTMENTS_TABLE, shape), parent_ticker="UBER", form="10-Q", filing_date="2026-08-06"
     )
     by = {(r["investee_ticker"], r["as_of_date"]): r for r in rows}
     assert by[("DIDIY", "2026-06-30")]["fair_value_disclosed_usd"] == 1_900_000_000.0

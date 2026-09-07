@@ -8,12 +8,17 @@ Provenance lives on ``note`` (``value_source=broker_sotp``) — no separate tabl
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from pathlib import Path
 from typing import Any, Literal
 from urllib.request import Request, urlopen
 
 import yaml
+
+from .identity import assert_pct_domain
+
+_log = logging.getLogger(__name__)
 
 # Internal parse shape (not a public DB/export schema).
 BROKER_SOTP_COLUMNS = [
@@ -53,8 +58,8 @@ _CMBIGM_ROW = re.compile(
     r"(?P<ticker>(?:\d{3,6}|[A-Z][A-Z0-9.]{0,9})"
     r"(?:\s+(?:US|HK|KS|JP|CH|LN|SS|SZ))?)\s+"
     r"(?P<stake>\d+(?:\.\d+)?)\s+"
-    r"(?P<mcap>[\d,]+)\s+"
-    r"(?P<value>[\d,]+)\s*$"
+    r"(?P<mcap>\d[\d,]*)\s+"
+    r"(?P<value>\d[\d,]*)\s*$"
 )
 
 _STOP_PREFIXES = (
@@ -266,8 +271,8 @@ _CMBIGM_INLINE = re.compile(
     r"\s+(?P<ticker>(?:\d{3,6}|[A-Z][A-Z0-9.]{0,9})"
     r"(?:\s+(?:US|HK|KS|JP|CH|LN|SS|SZ))?)"
     r"\s+(?P<stake>\d+(?:\.\d+)?)"
-    r"\s+(?P<mcap>[\d,]+)"
-    r"\s+(?P<value>[\d,]+)"
+    r"\s+(?P<mcap>\d[\d,]*)"
+    r"\s+(?P<value>\d[\d,]*)"
 )
 
 
@@ -296,11 +301,19 @@ def _row_from_match(m: re.Match[str]) -> dict[str, Any] | None:
         name,
         flags=re.I,
     ).strip()
+    try:
+        stake = assert_pct_domain(
+            m.group("stake"), field="ownership_pct", context=f"broker_sotp {name}"
+        )
+    except ValueError as e:
+        # Peer-comp tables (price / mcap / P/E) read as 612% "stakes" — skip.
+        _log.warning("broker_sotp: skipping row (%s): %r", e, m.group(0)[:120])
+        return None
     return {
         "investee_name": name,
         "investee_ticker_raw": raw_t,
         "investee_ticker": ticker,
-        "ownership_pct": float(m.group("stake")),
+        "ownership_pct": stake,
         "mkt_cap_usd_mn": float(m.group("mcap").replace(",", "")),
         "value_to_parent_hkd_mn": float(m.group("value").replace(",", "")),
     }

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from helpers import INPUT_SHAPES, shaped
 from hidden_stock.quirks.holdings.parse_notes import parse_investments_table
 
 # Real shape of UBER 10-Q 0001543151-22-000024 (Q2 2022): Didi moved from
@@ -38,9 +41,10 @@ def _fv(rows, ticker, as_of):
     return by[(ticker, as_of)]["fair_value_disclosed_usd"]
 
 
-def test_dash_cell_does_not_split_number_and_sections_sum():
+@pytest.mark.parametrize("shape", INPUT_SHAPES)
+def test_dash_cell_does_not_split_number_and_sections_sum(shape):
     rows = parse_investments_table(
-        UBER_10Q_2022Q2, parent_ticker="UBER", form="10-Q", filing_date="2022-08-04"
+        shaped(UBER_10Q_2022Q2, shape), parent_ticker="UBER", form="10-Q", filing_date="2022-08-04"
     )
     assert _fv(rows, "DIDIY", "2021-12-31") == 2_838_000_000.0  # was 283e6 (split)
     assert _fv(rows, "DIDIY", "2022-06-30") == 1_669_000_000.0  # was 8e6 (split)
@@ -48,9 +52,10 @@ def test_dash_cell_does_not_split_number_and_sections_sum():
     assert _fv(rows, "AUR", "2021-12-31") == 3_388_000_000.0
 
 
-def test_10k_year_pair_header_parses():
+@pytest.mark.parametrize("shape", INPUT_SHAPES)
+def test_10k_year_pair_header_parses(shape):
     rows = parse_investments_table(
-        UBER_10K_2025, parent_ticker="UBER", form="10-K", filing_date="2026-02-13"
+        shaped(UBER_10K_2025, shape), parent_ticker="UBER", form="10-K", filing_date="2026-02-13"
     )
     assert _fv(rows, "DIDIY", "2025-12-31") == 3_011_000_000.0
     assert _fv(rows, "GRAB", "2024-12-31") == 2_529_000_000.0

@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import html as html_lib
+import logging
 import re
 
 from .extract import load_investee_aliases, ownership_disclosure_slices, resolve_investee_ticker
+from .identity import assert_pct_domain
+
+_log = logging.getLogger(__name__)
 
 _MONTH_NAMES = {
     "january",
@@ -364,6 +368,16 @@ def parse_investment_notes(
         name = (row.get("investee_name") or "").strip()
         if not name:
             return
+        if row.get("ownership_pct") is not None:
+            try:
+                row["ownership_pct"] = assert_pct_domain(
+                    row["ownership_pct"],
+                    field="ownership_pct",
+                    context=f"{source_label} {accession_no or ''} {name}",
+                )
+            except ValueError as e:
+                _log.warning("parse_notes: skipping row (%s): %r", e, row.get("source_quote"))
+                return
         # Require economic signal for note rows (%, carrying, or disclosed FV)
         if (
             row.get("ownership_pct") is None

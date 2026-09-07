@@ -35,14 +35,21 @@ python scripts/export_equity_holdings_sheets.py \
   --ticker <RESOLVED> --live --history --new-sheet
 ```
 
-4. **Grade** (parallel judges; mechanical always runs inside the script):
+4. **Grade.** Iterate with `--judge-mode mechanical` (default: precheck +
+   derived digest, no LLM). Run `--judge-mode full` **once, on the final
+   export**; it refuses to re-judge an unchanged export (content hash in
+   `exports/<ticker>_last_judged.json`) unless `--force`.
 
 ```bash
-python scripts/grade_holdings_sheet.py \
-  --ticker <RESOLVED> \
-  --sheet-url '<URL>' \
-  --judges fable,codex
+python scripts/grade_holdings_sheet.py --ticker <RESOLVED>            # iterate
+python scripts/grade_holdings_sheet.py --ticker <RESOLVED> \
+  --sheet-url '<URL>' --judges fable,codex --judge-mode full         # final, once
 ```
+
+   Judges read `exports/<ticker>_judge_digest.md` (every row aggregated:
+   ticker × period coverage grid, every sell with its realized status, every
+   period's Dietz/flow, provenance counts, `since_last_digest` diff) — never a
+   truncated CSV slice. `--attach-csv` adds raw head-slices only on request.
 
 5. **Reply** with the judgment board: each judge’s verdict/score, blocking
    issues, agreement/disagreement, and one recommended next fix. Do not
@@ -118,7 +125,8 @@ When board is FAIL / NEEDS_WORK:
 1. `/reflect` why it shipped and why we missed it.
 2. Fix Dagster/pipeline so the class of bug cannot recur (assert / identity / coalesce / provenance stamp).
 3. Codify the invariant into this skill + `equity-holdings-sheets` (assert language, not last-bug name).
-4. Re-export `--live --history`, re-grade; do not declare fixed without a new board PASS.
+4. Re-export `--live --history`, re-grade mechanically until clean, then one
+   `--judge-mode full` on the final export; do not declare fixed without a new board PASS.
 
 ## Eventual swarm (not fully automated yet)
 
