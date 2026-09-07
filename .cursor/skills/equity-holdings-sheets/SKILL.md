@@ -56,7 +56,9 @@ dagster asset materialize -m hidden_stock.definitions \
 Depth is **calendar years** (`history_lookback_years`), not filing count. `history_max_filings` only caps how many filings are pulled inside that window.
 
 4. **Reply** with spreadsheet URL and sources used (`13f+13g+notes` fan-out; HK parents also use annual aggregates).
-5. **Grade** with `/holdings-sheet-swarm-grade <ticker> --sheet-url <URL>` before calling it done.
+5. **Grade** while iterating with `python scripts/grade_holdings_sheet.py --ticker <RESOLVED>` (default `--judge-mode mechanical`: precheck + `exports/<slug>_judge_digest.md`, no LLM call).
+6. **Reconcile** with `python scripts/reconcile_holdings.py --ticker <RESOLVED>`: re-fetches each cited EDGAR filing, checks the sheet's value string is in it plus the gitignored `data/<parent>_anchors.yaml` (template `data/anchors.example.yaml`), writes `exports/<slug>_reconcile.csv` (exit 1 on `not_found` / anchor mismatch). The grade precheck `unreconciled_rows` reads that CSV when present.
+7. **Full grade once** on the final export: `/holdings-sheet-swarm-grade <ticker> --sheet-url <URL>` (`--judge-mode full`; exit 3 when the export hash was already judged, `--force` to repeat) before calling it done.
 
 ## Tabs
 
@@ -64,7 +66,7 @@ Depth is **calendar years** (`history_lookback_years`), not filing count. `histo
 
 - `holdings_qoq_chart`: **calendar quarter-ends ≤ today**, **full named public stack** (sorted by latest size; filter top-N in Sheets). Display preference: **EOD `mark_at_filing_est_usd` → non-broker `$` → broker `$` last** (`basis=display_estimate_or_broker; not_portfolio_sot`). No OTHER bucket. Not every 13G filing date. Own tab with chart at top. Dietz / `portfolio_by_period` stay on portfolio SoT. `fanout_13g_hk` default lookback **8** years.
 - `returns_by_period` — portfolio MV, net external flow, **MTM** (primary), avg-cost + FIFO disposal estimates, Modified Dietz; **Dietz combo chart embeds here** (`dietz_return_pct` + `cum_dietz_growth`; estimated linked Dietz / CAGR subtitle)
-- `realized_pnl_qoq` — disposal events with `cost_method=avg|fifo` (avg is primary; FIFO sensitivity). No separate realized chart tabs (empty/zero for 13G-null-`$` parents).
+- `realized_pnl_qoq` — one row per sell/exit and `cost_method` (`avg` primary; `fifo` sensitivity): `period_end, investee_ticker, investee_name, shares_sold, cost_px, exit_px, realized_pnl_est, cost_method, cost_basis_status, cost_basis_note, holding_periods, lot_opened_period, filing_url, accession_no, note`. `cost_basis_status` ∈ `exact` (curated lots) / `estimated` (period-end MV proxy) / `mixed` / `partial` / `unknown` (no lot: 13G-only buys, truncated lookback); a sale with no lot keeps its row with null cost and the reason in `cost_basis_note`. Curated lots come from the gitignored `data/<parent>_cost_basis.yaml` (template `data/cost_basis.example.yaml`). No separate realized chart tabs (empty/zero for 13G-null-`$` parents).
 - `holding_returns` — per ticker × period weight, Dietz, contribution, MTM, avg/FIFO realized
 - `reported_vs_est` — BABA curated Interest and investment income vs summed calendar MTM (reconciliation; residual expected)
 
@@ -149,11 +151,11 @@ history.groupby(period_end, investee_ticker).size() == 1
 # open cited SC 13G/A when claim is ownership / exit
 ```
 
-1. Sheet `portfolio_by_period` / `chart_data`: for UBER mid-2026, DIDIY ≈ **1900** ($M), not ~482.
+1. Sheet `portfolio_by_period` / `holdings_qoq_chart`: for UBER mid-2026, DIDIY ≈ **1900** ($M), not ~482.
 2. History: **one row per ticker per `period_end`** (including `PRIV_*`).
 3. Open the parent’s latest 10-Q/10-K Investments table; match disclosed FV.
 4. 13G+$ rows cite Investments provenance, not only `source=13g`.
 5. `uv run pytest tests/test_holdings_ci_regressions.py tests/test_13g_exit_bili.py tests/ -q`.
-6. `/holdings-sheet-swarm-grade <ticker>` (mechanical + Fable + Codex) — invent on null-`$` rows is still FAIL.
+6. `scripts/grade_holdings_sheet.py --ticker <ticker>` (mechanical, iterate), `scripts/reconcile_holdings.py --ticker <ticker>`, then `/holdings-sheet-swarm-grade <ticker>` once (`--judge-mode full`: Fable + Codex) — invent on null-`$` rows is still FAIL.
 
 Fan-out: ticker → CIK → **13F + 13D/G + notes** → one row per ticker per period. Assert the class of bug, not the last ticker name.
