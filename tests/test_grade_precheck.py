@@ -93,3 +93,33 @@ def test_sell_without_realized_csv_is_unknown_not_pass(grade, tmp_path):
     hist, port = _write(tmp_path, "baba", rows, realized_rows=None)
     res = grade.mechanical_precheck(hist, port, parent="BABA")
     assert res["checks"]["sell_without_realized_row"] == "unknown"
+
+
+def _judge(name, verdict="pass", checks=None):
+    return {
+        "judge": name, "verdict": verdict, "score": 100 if verdict == "pass" else 50,
+        "blocking_issues": [], "minor_issues": [], "what_looks_good": [],
+        "checks": checks or {}, "summary": f"{name} ok",
+    }
+
+
+def test_board_with_unknown_check_is_needs_work_not_pass(grade, tmp_path):
+    results = [
+        _judge("mechanical", checks={"aur_one_per_period": "pass", "chart_ranking_sane": "unknown"}),
+        _judge("fable", checks={"didi_2026_06_30_fv": "n/a", "no_share_invent": "unknown"}),
+    ]
+    path = grade.write_board("BABA", tmp_path, results, None)
+    text = path.read_text(encoding="utf-8")
+    assert "BOARD: NEEDS_WORK" in text
+    assert "BOARD: PASS" not in text
+    assert "mechanical:chart_ranking_sane" in text
+    assert "fable:no_share_invent" in text
+
+
+def test_board_all_checks_resolved_is_pass(grade, tmp_path):
+    results = [
+        _judge("mechanical", checks={"aur_one_per_period": "pass", "didi_2026_06_30_fv": "n/a"}),
+        _judge("fable", checks={"no_share_invent": "pass"}),
+    ]
+    text = grade.write_board("BABA", tmp_path, results, None).read_text(encoding="utf-8")
+    assert "BOARD: PASS" in text

@@ -834,6 +834,17 @@ def _parse_json_response(text: str, *, judge: str) -> dict:
     return parse_json_response(text, judge=judge)
 
 
+def unknown_check_ids(results: list[dict]) -> list[str]:
+    """`judge:check` ids whose value is literally "unknown" (never evaluated)."""
+    out: list[str] = []
+    for r in results:
+        judge = str(r.get("judge") or "judge")
+        for cid, val in (r.get("checks") or {}).items():
+            if str(val).strip().lower() == "unknown":
+                out.append(f"{judge}:{cid}")
+    return out
+
+
 def write_board(ticker: str, out_dir: Path, results: list[dict], sheet_url: str | None) -> Path:
     path = out_dir / f"{ticker.lower()}_grade_board.md"
     lines = [
@@ -877,12 +888,19 @@ def write_board(ticker: str, out_dir: Path, results: list[dict], sheet_url: str 
             lines.append("")
 
     verdicts = {r.get("verdict") for r in results}
+    unknown_checks = unknown_check_ids(results)
     if "fail" in verdicts:
         board = "BOARD: FAIL"
-    elif "needs_work" in verdicts or len(verdicts) > 1:
+    elif "needs_work" in verdicts or len(verdicts) > 1 or unknown_checks:
+        # An unevaluated check is not evidence of a pass (unknown != PASS).
         board = "BOARD: NEEDS_WORK"
     else:
         board = "BOARD: PASS"
+    if unknown_checks:
+        lines.append("### Unknown checks (cannot PASS until evaluated)")
+        for cid in unknown_checks:
+            lines.append(f"- {cid}")
+        lines.append("")
     lines.insert(3, f"**{board}**")
     lines.insert(4, "")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

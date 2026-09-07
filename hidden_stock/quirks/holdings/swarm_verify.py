@@ -295,7 +295,11 @@ def stage_report_to_mechanical(report: Any, *, stage: str) -> dict:
         cid = getattr(f, "check_id", "check")
         msg = getattr(f, "message", "")
         ev = getattr(f, "evidence", {}) or {}
-        checks[cid] = "fail" if sev == "fail" else "pass" if sev == "info" else "unknown"
+        # "unknown" is reserved for checks that were never evaluated; a warn
+        # finding was evaluated and must not downgrade the board as unknown.
+        checks[cid] = (
+            "fail" if sev == "fail" else "pass" if sev == "info" else "warn" if sev == "warn" else "unknown"
+        )
         item = {
             "id": cid,
             "severity": msg,
@@ -352,13 +356,26 @@ def stage_report_to_mechanical(report: Any, *, stage: str) -> dict:
     }
 
 
+def unknown_check_ids(results: list[dict]) -> list[str]:
+    """`judge:check` ids whose value is literally "unknown" (never evaluated)."""
+    out: list[str] = []
+    for r in results:
+        judge = str(r.get("judge") or "judge")
+        for cid, val in (r.get("checks") or {}).items():
+            if str(val).strip().lower() == "unknown":
+                out.append(f"{judge}:{cid}")
+    return out
+
+
 def merge_board(mechanical: dict, judges: list[dict], *, stage: str) -> dict:
     """Merge mechanical + LLM judges into one board dict."""
     results = [mechanical] + list(judges)
     verdicts = {str(r.get("verdict") or "").lower() for r in results}
+    unknown_checks = unknown_check_ids(results)
     if "fail" in verdicts or str(mechanical.get("verdict")) == "fail":
         board = "FAIL"
-    elif "needs_work" in verdicts or len(verdicts - {""}) > 1:
+    elif "needs_work" in verdicts or len(verdicts - {""}) > 1 or unknown_checks:
+        # An unevaluated check is not evidence of a pass (unknown != PASS).
         board = "NEEDS_WORK"
     else:
         board = "PASS"
@@ -382,6 +399,7 @@ def merge_board(mechanical: dict, judges: list[dict], *, stage: str) -> dict:
         "recommended_fixes": fixes,
         "root_cause_class": root,
         "avoid_next_time": avoid,
+        "unknown_checks": unknown_checks,
         "results": results,
     }
 
@@ -414,6 +432,10 @@ def write_stage_board_md(
         lines.append("- recommended_fixes:")
         for fx in board["recommended_fixes"]:
             lines.append(f"  - {fx}")
+    if board.get("unknown_checks"):
+        lines.append("- unknown_checks (cannot PASS until evaluated):")
+        for cid in board["unknown_checks"]:
+            lines.append(f"  - {cid}")
     lines.append("")
     for r in board.get("results") or []:
         lines.append(f"## {r.get('judge')}")
