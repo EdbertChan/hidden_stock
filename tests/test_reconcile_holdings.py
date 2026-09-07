@@ -34,6 +34,12 @@ INFOTABLE_XML = """<?xml version="1.0"?><informationTable>
 G13_HTML = """<html><body><p>SCHEDULE 13D</p><p>Serve Robotics Inc.</p>
 <p>Amount beneficially owned: 5,298,833</p><p>Percent of class: 15.2%</p></body></html>"""
 
+D13A_ACC = "0001552781-25-000298"
+D13A_URL = f"https://www.sec.gov/Archives/edgar/data/{UBER_CIK}/000155278125000298/{D13A_ACC}-index.htm"
+D13A_XML = """<?xml version="1.0" encoding="UTF-8"?><edgarSubmission xmlns="http://www.sec.gov/edgar/schedule13D">
+<soleVotingPower>2070629.00</soleVotingPower><percentOfClass>3.36</percentOfClass></edgarSubmission>"""
+D13A_EXHIBIT = "<html><body><p>Joint filing agreement. No numbers here.</p></body></html>"
+
 
 class FakeEdgar:
     """Canned EDGAR: no network. Records every call so tests can assert caching."""
@@ -48,10 +54,17 @@ class FakeEdgar:
                 {"name": "ex31.htm", "size": 200},
             ],
             G13_ACC: [{"name": "serv-13d.htm", "size": 300}],
+            D13A_ACC: [
+                {"name": f"{D13A_ACC}-index.html", "size": ""},
+                {"name": "e25338_ex99-1.htm", "size": 17403},
+                {"name": "primary_doc.xml", "size": 9414},
+            ],
         }
         self.text = {
             (TENQ_ACC, "uber-20260630.htm"): TENQ_HTML,
             (G13_ACC, "serv-13d.htm"): G13_HTML,
+            (D13A_ACC, "primary_doc.xml"): D13A_XML,
+            (D13A_ACC, "e25338_ex99-1.htm"): D13A_EXHIBIT,
         }
 
     def list_filing_documents(self, cik, accession_no):
@@ -168,6 +181,39 @@ def test_13g_share_count_or_pct_anchored(fetcher):
     assert res["matched"] == "shares_held=5,298,833; ownership_pct=15.2%"
 
 
+def test_structured_13d_prefers_primary_doc_xml_over_exhibit(fetcher):
+    """Live miss on UBER/SERV 2026-06-30: the 13D/A's only .htm is an exhibit;
+    the share count sits in primary_doc.xml as 2070629.00 and the pct as bare 3.36."""
+    row = _row(
+        investee_ticker="SERV",
+        period_end="2026-06-30",
+        shares_held="2070629.0",
+        ownership_pct="3.36",
+        accession_no=D13A_ACC,
+        filing_url=D13A_URL,
+        note="source=13g form=SCHEDULE 13D/A cik=0001543151",
+    )
+    res = rc.reconcile_row(row, fetcher)
+    assert res["status"] == rc.STATUS_ANCHORED
+    assert res["document"] == "primary_doc.xml"
+    assert res["matched"] == "shares_held=2070629.00; ownership_pct=3.36"
+    assert ("fetch", D13A_ACC, "e25338_ex99-1.htm") not in fetcher.edgar.calls
+
+
+def test_pick_primary_document_demotes_exhibits():
+    pick = rc._pick_primary_document
+    assert pick([
+        {"name": "uber-20260630.htm", "size": 5000},
+        {"name": "uber-20260630ex311.htm", "size": 9000},
+        {"name": "d1dex991.htm", "size": 99999},
+        {"name": "R4.htm", "size": 999999},
+        {"name": "0001-index.htm", "size": 999999},
+    ]) == "uber-20260630.htm"
+    assert pick([{"name": "ex99-1.htm", "size": 10}, {"name": "0001.txt", "size": 99}]) == "ex99-1.htm"
+    assert pick([{"name": "0001.txt", "size": 99}]) == "0001.txt"
+    assert pick([{"name": "0001-index.htm", "size": 99}]) is None
+
+
 def test_no_citation_when_accession_blank(fetcher):
     res = rc.reconcile_row(_row(market_value_usd="1900000000.0", accession_no="", filing_url=""), fetcher)
     assert res["status"] == rc.STATUS_NO_CITATION
@@ -243,13 +289,17 @@ anchors:
   - investee_ticker: AUR
     period_end: "2026-06-30"
     expected_musd: 1763
+  - investee_ticker: JOBY
+    period_end: "2026-06-30"
+    expected_musd: 2020
 """,
     )
     anchors = rc.load_anchors("UBER", tmp_path)
-    assert len(anchors) == 3
+    assert len(anchors) == 4
     rows = [
         _row(market_value_usd="1900000000.0"),
-        _row(investee_ticker="GRAB", market_value_usd="2021000000.0"),
+        _row(investee_ticker="GRAB", market_value_usd="2020354242.0"),
+        _row(investee_ticker="JOBY", market_value_usd="2020354242.0"),
     ]
     out = rc.check_anchors(rows, anchors, fetcher=fetcher)
     by = {r["investee_ticker"]: r for r in out}
@@ -257,7 +307,8 @@ anchors:
     assert by["DIDIY"]["detail"] == "quote: found"
     assert by["DIDIY"]["document"] == "uber-20260630.htm"
     assert by["GRAB"]["status"] == rc.STATUS_ANCHOR_MISMATCH
-    assert "expected 2.02e+09" in by["GRAB"]["detail"]
+    assert by["GRAB"]["detail"] == "sheet 2,020,354,242 != expected 2,020,000,000 (tol 0)"
+    assert by["JOBY"]["status"] == rc.STATUS_ANCHOR_MATCH
     assert by["AUR"]["status"] == rc.STATUS_ANCHOR_MISSING_ROW
     assert rc.has_failures(out)
 

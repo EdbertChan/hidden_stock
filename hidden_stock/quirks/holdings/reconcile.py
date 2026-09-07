@@ -104,7 +104,7 @@ def cik_from_filing_url(url: Any) -> str | None:
 def _boundary(num_str: str) -> str:
     """Regex that matches ``num_str`` as a whole number (no digit run-on either side)."""
     core = re.escape(num_str)
-    return rf"(?<![\d.])(?<!\d,){core}(?!\d)(?!,\d)(?!\.\d)"
+    return rf"(?<![\d.])(?<!\d,){core}(?:\.0+)?(?!\d)(?!,\d)(?!\.\d)"
 
 
 def format_musd(fv_usd: float) -> str:
@@ -156,6 +156,7 @@ def _target_pct(pct: float) -> SearchTarget:
     if "." not in p:
         variants.add(f"{p}.0")
     pats = [rf"(?<![\d.]){re.escape(v)}\s?%" for v in sorted(variants)]
+    pats.append(_boundary(p))
     return SearchTarget("ownership_pct", _s(pct), f"{p}%", pats)
 
 
@@ -241,15 +242,26 @@ def normalize_document_text(raw: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
+_EXHIBIT_NAME = re.compile(r"(?<![a-ce-wyz])(?:ex|exhibit)[\-_.]?\d", re.I)
+
+
 def _pick_primary_document(docs: Iterable[dict]) -> str | None:
-    """Largest ``.htm`` that is not an index / XBRL viewer page; else largest ``.txt``."""
+    """Choose the document the sheet value should live in.
+
+    Order: ``primary_doc.xml`` (structured 13D/13G since 2024), then the largest
+    non-exhibit ``.htm`` that is not an index / XBRL viewer page, then the largest
+    exhibit ``.htm``, then the largest ``.txt``.
+    """
     htm: list[tuple[int, str]] = []
+    exhibits: list[tuple[int, str]] = []
     txt: list[tuple[int, str]] = []
     for d in docs:
         name = _s(d.get("name"))
         if not name:
             continue
         low = name.lower()
+        if low == "primary_doc.xml":
+            return name
         if "-index" in low or re.fullmatch(r"r\d+\.htm", low):
             continue
         if low in {"filingsummary.xml", "index.json"}:
@@ -259,10 +271,10 @@ def _pick_primary_document(docs: Iterable[dict]) -> str | None:
         except (TypeError, ValueError):
             size = 0
         if low.endswith((".htm", ".html")):
-            htm.append((size, name))
+            (exhibits if _EXHIBIT_NAME.search(low) else htm).append((size, name))
         elif low.endswith(".txt"):
             txt.append((size, name))
-    pool = htm or txt
+    pool = htm or exhibits or txt
     if not pool:
         return None
     return sorted(pool, key=lambda t: (-t[0], t[1]))[0][1]
@@ -465,8 +477,20 @@ def anchors_path(parent: str, data_dir: Path | None = None) -> Path:
     return (data_dir or _DATA_DIR) / f"{key}_anchors.yaml"
 
 
+MUSD_ROUNDING_TOLERANCE_USD = 500_000.0
+
+
+def _fmt_num(v: float) -> str:
+    return f"{v:,.0f}" if abs(v) >= 1000 else f"{v:g}"
+
+
 def load_anchors(parent: str, data_dir: Path | None = None) -> list[dict]:
-    """Read ``<parent>_anchors.yaml``; ``expected_musd`` is shorthand for market_value_usd in $M."""
+    """Read ``<parent>_anchors.yaml``.
+
+    ``expected_musd`` is shorthand for market_value_usd in $M and carries an
+    implicit +/- $0.5M rounding tolerance (a filing prints whole millions);
+    ``expected_value`` is exact unless ``tolerance_pct`` / ``tolerance_abs`` is set.
+    """
     path = anchors_path(parent, data_dir)
     if not path.is_file():
         return []
@@ -479,9 +503,11 @@ def load_anchors(parent: str, data_dir: Path | None = None) -> list[dict]:
         pe = _s(e.get("period_end"))[:10]
         fld = _s(e.get("field")) or "market_value_usd"
         expected = _f(e.get("expected_value"))
+        tolerance_abs = _f(e.get("tolerance_abs")) or 0.0
         if expected is None and e.get("expected_musd") is not None:
             expected = float(e["expected_musd"]) * 1_000_000.0
             fld = "market_value_usd"
+            tolerance_abs = max(tolerance_abs, MUSD_ROUNDING_TOLERANCE_USD)
         if not t or not pe or expected is None:
             continue
         out.append(
@@ -491,6 +517,7 @@ def load_anchors(parent: str, data_dir: Path | None = None) -> list[dict]:
                 "field": fld,
                 "expected_value": expected,
                 "tolerance_pct": _f(e.get("tolerance_pct")) or 0.0,
+                "tolerance_abs": tolerance_abs,
                 "source_url": _s(e.get("source_url")),
                 "quote": _s(e.get("quote")),
             }
@@ -518,7 +545,7 @@ def check_anchors(
             period_end=a["period_end"],
             investee_ticker=a["investee_ticker"],
             field=a["field"],
-            searched=f"expected {a['field']}={a['expected_value']:g}",
+            searched=f"expected {a['field']}={_fmt_num(a['expected_value'])}",
             source_kind="anchors.yaml",
             accession_no=a["source_url"],
         )
@@ -530,7 +557,7 @@ def check_anchors(
             )
             continue
         exp = a["expected_value"]
-        tol = abs(exp) * (a["tolerance_pct"] / 100.0)
+        tol = max(abs(exp) * (a["tolerance_pct"] / 100.0), a.get("tolerance_abs") or 0.0)
         ok = any(abs(v - exp) <= tol + 1e-6 for v in vals)
         quote_note = ""
         if a["quote"] and a["source_url"] and fetcher is not None:
@@ -541,13 +568,14 @@ def check_anchors(
                 quote_note = "quote: found" if q in text else "quote: NOT found in source_url"
             except Exception as e:
                 quote_note = f"quote: fetch_error {type(e).__name__}: {e}"
-        mismatch = "" if ok else f"sheet {vals} != expected {exp:g}"
+        shown = ",".join(_fmt_num(v) for v in vals)
+        mismatch = "" if ok else f"sheet {shown} != expected {_fmt_num(exp)} (tol {_fmt_num(tol)})"
         out.append(
             {
                 **base,
                 "status": STATUS_ANCHOR_MATCH if ok else STATUS_ANCHOR_MISMATCH,
-                "sheet_value": ",".join(f"{v:g}" for v in vals),
-                "matched": f"{a['field']}={vals[0]:g}" if ok else "",
+                "sheet_value": shown,
+                "matched": f"{a['field']}={_fmt_num(vals[0])}" if ok else "",
                 "detail": " | ".join(x for x in (mismatch, quote_note) if x),
             }
         )

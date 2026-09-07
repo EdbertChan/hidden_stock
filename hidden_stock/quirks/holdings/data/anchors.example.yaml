@@ -6,7 +6,7 @@ anchors:
     period_end: "2026-06-30"
     field: market_value_usd        # market_value_usd | shares_held | ownership_pct
     expected_value: 1900000000     # sheet units (USD / shares / percent)
-    # expected_musd: 1900          # shorthand for market_value_usd in $ millions
-    tolerance_pct: 0               # optional, default exact
+    # expected_musd: 1900          # shorthand for market_value_usd in $ millions (implicit +/- $0.5M rounding)
+    tolerance_pct: 0               # optional; also tolerance_abs (sheet units); default exact
     source_url: https://www.sec.gov/Archives/edgar/data/<cik>/<accession-nodash>/<doc>.htm
     quote: "Example Co. 1,900"     # optional; checked verbatim in source_url text
