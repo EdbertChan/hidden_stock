@@ -53,8 +53,8 @@ _CMBIGM_ROW = re.compile(
     r"(?P<ticker>(?:\d{3,6}|[A-Z][A-Z0-9.]{0,9})"
     r"(?:\s+(?:US|HK|KS|JP|CH|LN|SS|SZ))?)\s+"
     r"(?P<stake>\d+(?:\.\d+)?)\s+"
-    r"(?P<mcap>[\d,]+)\s+"
-    r"(?P<value>[\d,]+)\s*$"
+    r"(?P<mcap>\d[\d,]*)\s+"
+    r"(?P<value>\d[\d,]*)\s*$"
 )
 
 _STOP_PREFIXES = (
@@ -266,8 +266,8 @@ _CMBIGM_INLINE = re.compile(
     r"\s+(?P<ticker>(?:\d{3,6}|[A-Z][A-Z0-9.]{0,9})"
     r"(?:\s+(?:US|HK|KS|JP|CH|LN|SS|SZ))?)"
     r"\s+(?P<stake>\d+(?:\.\d+)?)"
-    r"\s+(?P<mcap>[\d,]+)"
-    r"\s+(?P<value>[\d,]+)"
+    r"\s+(?P<mcap>\d[\d,]*)"
+    r"\s+(?P<value>\d[\d,]*)"
 )
 
 

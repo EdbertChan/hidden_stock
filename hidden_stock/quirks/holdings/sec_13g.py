@@ -178,13 +178,13 @@ def parse_13g_html(html_text: str) -> dict:
     # so "...Person 0 10 Check Box" yields 0, not row number 10.
     m = re.search(
         r"Aggregate Amount Beneficially Owned by Each Reporting Person"
-        r"[^0-9]{0,40}(?P<sh>[\d,]+)",
+        r"[^0-9]{0,40}(?P<sh>\d[\d,]*)",
         text,
         re.I,
     )
     if not m:
         m = re.search(
-            r"Sole Voting Power[^0-9]{0,40}(?P<sh>[\d,]{4,})",
+            r"Sole Voting Power[^0-9]{0,40}(?P<sh>\d[\d,]{3,})",
             text,
             re.I,
         )
