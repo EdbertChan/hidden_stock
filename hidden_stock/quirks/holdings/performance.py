@@ -635,6 +635,45 @@ def assert_mtm_identity(
             )
 
 
+def assert_sell_realized_coverage(
+    history_rows: list[dict],
+    realized_events: list[dict],
+    *,
+    context: str = "sell_realized_coverage",
+) -> None:
+    """Every sell/exit row with shares_delta<0 has >=1 avg-cost realized event.
+
+    The realized tab once dropped sales with no cost lot via a silent
+    ``continue``; the sheet then showed a sale with no P&L row. Coverage is
+    keyed on (period_end, ticker) and only ``cost_method=avg`` counts — FIFO is
+    the sensitivity leg, never the primary row.
+    """
+    covered: set[tuple[str, str]] = set()
+    for e in realized_events or []:
+        if str(e.get("cost_method") or "") != "avg":
+            continue
+        t = normalize_ticker(e.get("investee_ticker")) or str(e.get("investee_ticker") or "")
+        covered.add((str(e.get("period_end") or ""), t.upper()))
+    missing: list[str] = []
+    for r in history_rows or []:
+        if str(r.get("action") or "") not in {"sell", "exit"}:
+            continue
+        delta = _f(r.get("shares_delta"))
+        if delta is None or delta >= -1e-12:
+            continue
+        t = _ticker_key(r)
+        pe = str(r.get("period_end") or "")
+        if not t or not pe:
+            continue
+        if (pe, t.upper()) not in covered:
+            missing.append(f"{pe}/{t} (shares_delta={delta:g})")
+    if missing:
+        raise AssertionError(
+            f"{context}: {len(missing)} sell/exit row(s) with no cost_method=avg "
+            f"realized event: {', '.join(missing[:20])}"
+        )
+
+
 def period_portfolio_returns(
     history_rows: list[dict],
     realized_events: list[dict],
@@ -1149,6 +1188,7 @@ def performance_frames(
     _, realized = build_lots_and_realized(
         rows, disclosed_lots=load_disclosed_cost_basis(parent)
     )
+    assert_sell_realized_coverage(rows, realized)
     returns = period_portfolio_returns(rows, realized)
     realized_df = realized_events_frame(realized)
     frames = {

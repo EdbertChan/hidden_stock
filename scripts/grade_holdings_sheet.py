@@ -546,6 +546,54 @@ def mechanical_precheck(
         else:
             checks["no_blank_public_ticker"] = "pass"
 
+    # Every sell/exit must have a cost_method=avg row in realized_pnl_qoq
+    # (the realized tab once dropped no-cost-lot sales via a silent `continue`).
+    checks.setdefault("sell_without_realized_row", "unknown")
+    realized_csv = history_csv.parent / history_csv.name.replace(
+        "_equity_holdings_history.csv", "_realized_pnl_qoq.csv"
+    )
+    if {"action", "shares_delta", "period_end", "investee_ticker"} <= set(hist.columns):
+        action_l = hist["action"].astype(str).str.lower()
+        delta = pd.to_numeric(hist["shares_delta"], errors="coerce")
+        sells = hist[action_l.isin({"sell", "exit"}) & delta.notna() & (delta < 0)]
+        if not len(sells):
+            checks["sell_without_realized_row"] = "pass"
+        elif realized_csv.is_file():
+            realized = pd.read_csv(realized_csv)
+            covered: set[tuple[str, str]] = set()
+            if {"period_end", "investee_ticker"} <= set(realized.columns):
+                method = (
+                    realized["cost_method"].astype(str).str.lower()
+                    if "cost_method" in realized.columns
+                    else pd.Series(["avg"] * len(realized), index=realized.index)
+                )
+                for r in realized[method == "avg"].itertuples():
+                    covered.add(
+                        (str(r.period_end), str(r.investee_ticker).strip().upper())
+                    )
+            uncovered = [
+                f"{r.period_end}/{str(r.investee_ticker).strip().upper()}"
+                for r in sells.itertuples()
+                if (str(r.period_end), str(r.investee_ticker).strip().upper()) not in covered
+            ]
+            if uncovered:
+                issues.append(
+                    {
+                        "id": "sell_without_realized_row",
+                        "severity": (
+                            "positions_qoq sell/exit with no cost_method=avg row in "
+                            "realized_pnl_qoq (sale silently dropped from P&L)"
+                        ),
+                        "evidence": uncovered[:20],
+                    }
+                )
+                checks["sell_without_realized_row"] = "fail"
+            else:
+                checks["sell_without_realized_row"] = "pass"
+        else:
+            # Sales exist but no realized CSV to check against: not proven.
+            checks["sell_without_realized_row"] = "unknown"
+
     good = []
     if not issues:
         good.append(f"Mechanical uniqueness + invent checks passed for parent={parent_u}")
