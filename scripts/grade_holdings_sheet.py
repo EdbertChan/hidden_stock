@@ -689,7 +689,16 @@ def mechanical_precheck(
     }
 
 
-def build_packet(*, ticker: str, sheet_url: str | None, out_dir: Path) -> Path:
+def build_packet(
+    *,
+    ticker: str,
+    sheet_url: str | None,
+    out_dir: Path,
+    digest_text: str | None = None,
+    attach_csv: bool = False,
+) -> Path:
+    """Write the judge packet. Judges see the derived digest (every row,
+    aggregated) — raw CSV head-slices are attached only with ``attach_csv``."""
     t = ticker.lower()
     parent_u = str(ticker or "").strip().upper()
     portfolio = out_dir / f"{t}_portfolio_by_period.csv"
@@ -814,46 +823,65 @@ def build_packet(*, ticker: str, sheet_url: str | None, out_dir: Path) -> Path:
     except Exception as e:
         lines.extend([f"(jump audit skipped: {e})", ""])
 
+    if digest_text is None:
+        from hidden_stock.quirks.holdings.judge_digest import write_digest
+
+        digest_text, _data, _json_path = write_digest(out_dir, t)
     lines.extend(
         [
-            "## exit / 13g_exit rows (sample — check before stale-M&A FAIL)",
+            "## Export digest (complete — every row aggregated; no CSV slice)",
             "",
-            "```csv",
-            _exit_rows_snippet(history),
-            "```",
+            "The coverage grid, sell/realized table, per-period returns and "
+            "provenance counts below are derived from ALL rows of every export "
+            "CSV. Treat a `-` cell, a `realized=MISSING` sell, or a missing "
+            "quarter here as real evidence; nothing is hidden past a slice. "
+            "`since_last_digest` shows what changed since the previous grade "
+            "iteration.",
             "",
-            "## portfolio_by_period.csv",
-            "",
-            "```csv",
-            _read_csv_snippet(portfolio),
-            "```",
-            "",
-            "## equity_holdings_history.csv (excerpt)",
-            "",
-            "```csv",
-            _read_csv_snippet(history, max_chars=24000),
-            "```",
+            digest_text.rstrip(),
             "",
         ]
     )
-    # Attach parent-scoped performance CSVs when present
-    for label, name in (
-        ("returns_by_period", f"{t}_returns_by_period.csv"),
-        ("realized_pnl_qoq", f"{t}_realized_pnl_qoq.csv"),
-        ("reported_vs_est", f"{t}_reported_vs_est.csv"),
-    ):
-        path = out_dir / name
-        if path.is_file():
-            lines.extend(
-                [
-                    f"## {label}.csv (excerpt)",
-                    "",
-                    "```csv",
-                    _read_csv_snippet(path, max_chars=8000),
-                    "```",
-                    "",
-                ]
-            )
+    if attach_csv:
+        lines.extend(
+            [
+                "## exit / 13g_exit rows (sample — check before stale-M&A FAIL)",
+                "",
+                "```csv",
+                _exit_rows_snippet(history),
+                "```",
+                "",
+                "## portfolio_by_period.csv (raw head-slice attachment)",
+                "",
+                "```csv",
+                _read_csv_snippet(portfolio),
+                "```",
+                "",
+                "## equity_holdings_history.csv (raw head-slice attachment)",
+                "",
+                "```csv",
+                _read_csv_snippet(history, max_chars=24000),
+                "```",
+                "",
+            ]
+        )
+        for label, name in (
+            ("returns_by_period", f"{t}_returns_by_period.csv"),
+            ("realized_pnl_qoq", f"{t}_realized_pnl_qoq.csv"),
+            ("reported_vs_est", f"{t}_reported_vs_est.csv"),
+        ):
+            path = out_dir / name
+            if path.is_file():
+                lines.extend(
+                    [
+                        f"## {label}.csv (raw head-slice attachment)",
+                        "",
+                        "```csv",
+                        _read_csv_snippet(path, max_chars=8000),
+                        "```",
+                        "",
+                    ]
+                )
     lines.extend(
         [
             "## Your job",
@@ -977,6 +1005,131 @@ def write_board(ticker: str, out_dir: Path, results: list[dict], sheet_url: str 
     return path
 
 
+JUDGE_MODES = ("mechanical", "full")
+EXIT_FULL_SKIPPED = 3
+
+
+def _default_llm_runner(name: str, packet_text: str, schema: dict) -> dict:
+    if name == "fable":
+        return run_fable(packet_text, schema)
+    if name == "codex":
+        return run_codex(packet_text, SCHEMA_PATH)
+    raise ValueError(f"unknown judge {name}")
+
+
+def run_grade(
+    *,
+    ticker: str,
+    out_dir: Path,
+    judges: list[str],
+    judge_mode: str = "mechanical",
+    force: bool = False,
+    attach_csv: bool = False,
+    sheet_url: str | None = None,
+    llm_runner=None,
+    schema: dict | None = None,
+) -> tuple[int, dict]:
+    """Mechanical precheck + digest always; LLM judges only in ``full`` mode,
+    and only once per export content hash unless ``force``.
+
+    Returns (exit_code, info). ``info['skip_reason']`` is the printed reason
+    when the LLM judges did not run; exit code ``EXIT_FULL_SKIPPED`` means
+    ``full`` was asked for but refused because nothing changed.
+    """
+    from hidden_stock.quirks.holdings.judge_digest import (
+        export_content_hash,
+        full_judge_skip_reason,
+        record_last_judged,
+        write_digest,
+    )
+
+    if judge_mode not in JUDGE_MODES:
+        raise ValueError(f"judge_mode must be one of {JUDGE_MODES}, got {judge_mode!r}")
+    tslug = ticker.lower()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    mech = mechanical_precheck(
+        out_dir / f"{tslug}_equity_holdings_history.csv",
+        out_dir / f"{tslug}_portfolio_by_period.csv",
+        parent=ticker,
+    )
+    (out_dir / f"{tslug}_grade_mechanical.json").write_text(
+        json.dumps(mech, indent=2) + "\n", encoding="utf-8"
+    )
+    digest_text, digest_data, digest_json = write_digest(out_dir, tslug, mechanical=mech)
+    content_hash = export_content_hash(out_dir, tslug)
+    packet_path = build_packet(
+        ticker=ticker,
+        sheet_url=sheet_url,
+        out_dir=out_dir,
+        digest_text=digest_text,
+        attach_csv=attach_csv,
+    )
+    results: list[dict] = [mech]
+    llm_judges = [j for j in judges if j != "mechanical"]
+    info: dict = {
+        "content_hash": content_hash,
+        "digest_chars": len(digest_text),
+        "digest_json": str(digest_json),
+        "packet": str(packet_path),
+        "llm_judges_run": [],
+        "skip_reason": None,
+    }
+
+    skip_reason = full_judge_skip_reason(
+        out_dir, tslug, judge_mode=judge_mode, force=force, content_hash=content_hash
+    )
+    if not llm_judges and skip_reason is None:
+        skip_reason = "no LLM judges requested (--judges)"
+    exit_code = 0
+    if skip_reason:
+        info["skip_reason"] = skip_reason
+        print(f"LLM judges skipped: {skip_reason}", file=sys.stderr)
+        if judge_mode == "full" and llm_judges:
+            exit_code = EXIT_FULL_SKIPPED
+    else:
+        packet_text = packet_path.read_text(encoding="utf-8")
+        schema = schema or json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        runner = llm_runner or _default_llm_runner
+        with ThreadPoolExecutor(max_workers=max(1, len(llm_judges))) as pool:
+            futs = {pool.submit(runner, j, packet_text, schema): j for j in llm_judges}
+            for fut in as_completed(futs):
+                name = futs[fut]
+                try:
+                    result = fut.result()
+                except Exception as e:
+                    result = {
+                        "judge": name,
+                        "verdict": "needs_work",
+                        "score": 0,
+                        "blocking_issues": [
+                            {"id": "exception", "severity": str(e), "evidence": repr(e)}
+                        ],
+                        "minor_issues": [],
+                        "what_looks_good": [],
+                        "checks": {
+                            "didi_2026_06_30_fv": "unknown",
+                            "grab_aurora_vs_10q": "unknown",
+                            "aur_one_per_period": "unknown",
+                            "no_otc_invent_marks": "unknown",
+                            "chart_ranking_sane": "unknown",
+                        },
+                        "summary": f"{name} raised",
+                    }
+                out_json = out_dir / f"{tslug}_grade_{name}.json"
+                out_json.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+                results.append(result)
+                info["llm_judges_run"].append(name)
+        info["last_judged"] = str(
+            record_last_judged(out_dir, tslug, content_hash=content_hash, judges=llm_judges)
+        )
+
+    order = {n: i for i, n in enumerate(judges)}
+    results.sort(key=lambda r: order.get(str(r.get("judge")), 99))
+    board = write_board(ticker, out_dir, results, sheet_url)
+    info["board"] = str(board)
+    return exit_code, info
+
+
 def main() -> int:
     _load_dotenv()
     p = argparse.ArgumentParser(description=__doc__)
@@ -986,82 +1139,46 @@ def main() -> int:
     p.add_argument(
         "--judges",
         default="fable,codex",
-        help="Comma list: fable,codex",
+        help="Comma list: fable,codex (only run with --judge-mode full)",
+    )
+    p.add_argument(
+        "--judge-mode",
+        choices=JUDGE_MODES,
+        default="mechanical",
+        help=(
+            "mechanical (default): precheck + digest only, no LLM. "
+            "full: also run LLM judges — once per export content hash."
+        ),
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run LLM judges in full mode even if this export hash was judged before",
+    )
+    p.add_argument(
+        "--attach-csv",
+        action="store_true",
+        help="Also attach raw CSV head-slices to the packet (digest is always included)",
     )
     args = p.parse_args()
 
     from hidden_stock.quirks.holdings.parents import normalize_parent
 
     ticker = normalize_parent(args.ticker)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    packet_path = build_packet(ticker=ticker, sheet_url=args.sheet_url, out_dir=out_dir)
-    packet_text = packet_path.read_text(encoding="utf-8")
-    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
-
-    tslug = ticker.lower()
-    mech = mechanical_precheck(
-        out_dir / f"{tslug}_equity_holdings_history.csv",
-        out_dir / f"{tslug}_portfolio_by_period.csv",
-        parent=ticker,
-    )
-    (out_dir / f"{tslug}_grade_mechanical.json").write_text(
-        json.dumps(mech, indent=2) + "\n", encoding="utf-8"
-    )
-    results: list[dict] = [mech]
-
     judges = [j.strip().lower() for j in args.judges.split(",") if j.strip()]
-    # mechanical always runs above; strip it from LLM pool
-    llm_judges = [j for j in judges if j != "mechanical"]
-
-    def _run(name: str) -> dict:
-        if name == "fable":
-            return run_fable(packet_text, schema)
-        if name == "codex":
-            return run_codex(packet_text, SCHEMA_PATH)
-        raise ValueError(f"unknown judge {name}")
-
-    with ThreadPoolExecutor(max_workers=max(1, len(llm_judges))) as pool:
-        futs = {pool.submit(_run, j): j for j in llm_judges}
-        for fut in as_completed(futs):
-            name = futs[fut]
-            try:
-                result = fut.result()
-            except Exception as e:
-                result = {
-                    "judge": name,
-                    "verdict": "needs_work",
-                    "score": 0,
-                    "blocking_issues": [
-                        {
-                            "id": "exception",
-                            "severity": str(e),
-                            "evidence": repr(e),
-                        }
-                    ],
-                    "minor_issues": [],
-                    "what_looks_good": [],
-                    "checks": {
-                        "didi_2026_06_30_fv": "unknown",
-                        "grab_aurora_vs_10q": "unknown",
-                        "aur_one_per_period": "unknown",
-                        "no_otc_invent_marks": "unknown",
-                        "chart_ranking_sane": "unknown",
-                    },
-                    "summary": f"{name} raised",
-                }
-            out_json = out_dir / f"{ticker.lower()}_grade_{name}.json"
-            out_json.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-            results.append(result)
-
-    # Stable order
-    order = {n: i for i, n in enumerate(judges)}
-    results.sort(key=lambda r: order.get(str(r.get("judge")), 99))
-    board = write_board(ticker, out_dir, results, args.sheet_url)
+    code, info = run_grade(
+        ticker=ticker,
+        out_dir=Path(args.out_dir),
+        judges=judges,
+        judge_mode=args.judge_mode,
+        force=args.force,
+        attach_csv=args.attach_csv,
+        sheet_url=args.sheet_url,
+    )
+    board = Path(info["board"])
     print(board.read_text(encoding="utf-8"))
-    print(f"\nWrote {board}", file=sys.stderr)
-    return 0
+    print(f"\nWrote {board} (digest {info['digest_chars']} chars)", file=sys.stderr)
+    return code
 
 
 if __name__ == "__main__":
