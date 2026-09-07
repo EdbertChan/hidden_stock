@@ -347,3 +347,606 @@ def test_clean_scenario_is_pass_with_every_check_resolved(clean: Scenario):
     assert "BOARD: PASS" in clean.board
     assert clean.mech["checks"]["unreconciled_rows"] == "pass"
 
+
+@defect(
+    "sell_no_cost_lot_13g_only",
+    ("sell_without_realized_row", "assert_sell_realized_coverage"),
+    "drop the SERV 2025-03-31 rows from realized_pnl_qoq.csv",
+)
+def _sell_no_cost_lot():
+    def fires(ctx: Ctx):
+        realized = ctx.clean.records("realized_pnl_qoq")
+        serv = [r for r in realized if r["investee_ticker"] == "SERV"]
+        assert [(r["period_end"], r["cost_method"], r["cost_basis_status"]) for r in serv] == [
+            ("2025-03-31", "avg", "unknown")
+        ]
+        assert "13g_only_no_dollars" in serv[0]["cost_basis_note"]
+        out = ctx.export_copy()
+        _edit_csv(
+            out / f"{SLUG}_realized_pnl_qoq.csv",
+            lambda df: df[df["investee_ticker"] != "SERV"],
+        )
+        res = precheck(ctx.grade, out)
+        assert res["checks"]["sell_without_realized_row"] == "fail"
+        assert "sell_without_realized_row" in _issue_ids(res)
+        assert "2025-03-31/SERV" in str(
+            next(i for i in res["blocking_issues"] if i["id"] == "sell_without_realized_row")["evidence"]
+        )
+        assert res["verdict"] == "fail"
+        assert "BOARD: FAIL" in run_grade(ctx.grade, out)[3]
+        without = [r for r in realized if r["investee_ticker"] != "SERV"]
+        with pytest.raises(AssertionError, match=r"sell_realized_coverage.*2025-03-31/SERV"):
+            perf_mod.assert_sell_realized_coverage(ctx.clean.rows, without)
+
+    def silent(ctx: Ctx):
+        assert ctx.clean.mech["checks"]["sell_without_realized_row"] == "pass"
+        assert perf_mod.assert_sell_realized_coverage(
+            ctx.clean.rows, ctx.clean.records("realized_pnl_qoq")
+        ) is None
+
+    return fires, silent
+
+
+@defect(
+    "note_column_date_off_grid",
+    ("assert_note_dates_in_period_grid", "period_grid_gap"),
+    "add a 10-Q whose 2025-06-30 column has $ but no 13F period; drop 2024-09-30 from the CSV",
+)
+def _note_column_off_grid():
+    def fires(ctx: Ctx):
+        edgar = FakeEdgar(note_filings=[OFFGRID_10Q] + NOTE_FILINGS)
+        with pytest.raises(ValueError, match=r"period_grid.*2025-06-30"):
+            build_history(edgar)
+        out = ctx.export_copy()
+        _edit_csv(
+            out / f"{SLUG}_equity_holdings_history.csv",
+            lambda df: df[df["period_end"].str[:10] != "2024-09-30"],
+        )
+        res = precheck(ctx.grade, out)
+        assert res["checks"]["period_grid_gap"] == "fail"
+        gap = next(i for i in res["minor_issues"] if i["id"] == "period_grid_gap")
+        assert gap["evidence"] == ["2024-09-30"]
+        assert res["verdict"] == "needs_work"
+        assert "BOARD: NEEDS_WORK" in run_grade(ctx.grade, out)[3]
+
+    def silent(ctx: Ctx):
+        assert ctx.clean.meta["num_note_grid_periods"] == 1
+        assert ctx.clean.mech["checks"]["period_grid_gap"] == "pass"
+        history_mod.assert_note_dates_in_period_grid(
+            [], GRID, lookback_start="2000-01-01", upper=AS_OF
+        )
+
+    return fires, silent
+
+
+@defect(
+    "tenk_flattened_earlier_header",
+    ("parse_investments_table.header_scan",),
+    "10-K production text whose first two-date header is the balance sheet, not the Investments table",
+)
+def _tenk_header_scan():
+    from hidden_stock.quirks.holdings.parse_notes import (
+        _AS_OF_DATES_RE,
+        _AS_OF_YEAR_PAIR_RE,
+        _INVESTMENTS_ROW_RE,
+        parse_investments_table,
+    )
+
+    def _prose(text: str) -> str:
+        return re.sub(r"\s+", " ", text)
+
+    def fires(ctx: Ctx):
+        text = as_production_text(_fixture("testco_10k_2024.htm"))
+        prose = _prose(text)
+        first = min(
+            [m.start() for m in _AS_OF_DATES_RE.finditer(prose)]
+            + [m.start() for m in _AS_OF_YEAR_PAIR_RE.finditer(prose)]
+        )
+        assert "Cash and cash equivalents" in prose[first : first + 200]
+        assert _INVESTMENTS_ROW_RE.search(prose[first : first + 4000]) is None
+        assert parse_investments_table(prose[first : first + 4000], parent_ticker=PARENT, form="10-K") == []
+        rows = parse_investments_table(text, parent_ticker=PARENT, form="10-K", filing_date="2025-02-10")
+        fv = {(r["investee_ticker"], r["as_of_date"]): r["fair_value_disclosed_usd"] for r in rows}
+        assert fv[("DIDIY", "2024-12-31")] == 2.1e9 and fv[("DHER.DE", "2024-12-31")] == 5.2e8
+        assert fv[("DIDIY", "2023-12-31")] == 1.9e9
+
+    def silent(ctx: Ctx):
+        didi = _by(ctx.clean.rows, "2024-12-31", "DIDIY")
+        assert didi["market_value_usd"] == 2.1e9
+        assert didi["accession_no"] == "0009999999-25-000001"
+        assert "10k_investments_table" in didi["note"]
+
+    return fires, silent
+
+
+NARRATIVE = (
+    "Balances As of December 31, 2017 June 30, 2018 Restricted cash 1,000 1,200 "
+    "During the period we recognized an unrealized gain on our investment in "
+    "Didi, $501 million, and other gains of $20 million."
+)
+
+
+@defect(
+    "narrative_comma_amount",
+    ("parse_investments_table.digit_anchor",),
+    'narrative "Didi, $501 million" after a two-date header (no table row)',
+)
+def _narrative_comma_amount():
+    from hidden_stock.quirks.holdings.parse_notes import _INVESTMENTS_ROW_RE, parse_investments_table
+
+    def fires(ctx: Ctx):
+        old = re.compile(_INVESTMENTS_ROW_RE.pattern.replace(r"\d[\d,]*", r"[\d,]+"), re.IGNORECASE)
+        assert old.pattern != _INVESTMENTS_ROW_RE.pattern
+        m = old.search(NARRATIVE)
+        assert m and m.group("a") == "," and m.group("b") == "501"
+        assert _INVESTMENTS_ROW_RE.search(NARRATIVE) is None
+        assert parse_investments_table(NARRATIVE, parent_ticker=PARENT, form="10-K") == []
+
+    def silent(ctx: Ctx):
+        tenk = as_production_text(_fixture("testco_10k_2024.htm"))
+        assert "Didi, $501 million" in tenk
+        rows = parse_investments_table(tenk, parent_ticker=PARENT, form="10-K")
+        assert 5.01e8 not in {r["fair_value_disclosed_usd"] for r in rows}
+        didi = sorted(r["market_value_usd"] for r in ctx.clean.rows if r["investee_ticker"] == "DIDIY")
+        assert didi == [1.9e9, 1.95e9, 2.0e9, 2.05e9, 2.1e9, 2.15e9]
+
+    return fires, silent
+
+
+@defect(
+    "peer_comps_table_612pct",
+    ("assert_pct_domain", "parse_cmbigm_strategic_investments"),
+    "CMBI peer-comp table (price/mcap/PE columns); SERV 13D/A restated at 612%",
+)
+def _peer_comps_612():
+    from hidden_stock.quirks.holdings.broker_sotp import parse_cmbigm_strategic_investments
+    from hidden_stock.quirks.holdings.identity import assert_pct_domain
+
+    def fires(ctx: Ctx):
+        assert parse_cmbigm_strategic_investments(_fixture("cmbigm_peer_comps.txt")) == []
+        with pytest.raises(ValueError, match=r"ownership_pct=612\.0 outside \(0, 100\]"):
+            assert_pct_domain(612.0, field="ownership_pct", context="peer_comps")
+        bad = _fixture("serv_13da.htm").replace("13.1%", "612.0%")
+        edgar = FakeEdgar(docs={"serv_13da.htm": bad})
+        with ctx.caplog.at_level(logging.WARNING):
+            rows, _meta = build_history(edgar)
+        assert any("ownership_pct=612.0" in r.getMessage() for r in ctx.caplog.records)
+        serv = _by(rows, "2025-03-31", "SERV")
+        assert (serv["action"], serv["shares_held"]) == ("hold", 5_298_833.0)
+
+    def silent(ctx: Ctx):
+        real = parse_cmbigm_strategic_investments(
+            (_ROOT / "tests" / "fixtures" / "broker_sotp" / "cmbigm_strategic_investments_snippet.txt").read_text(encoding="utf-8")
+        )
+        assert real and all(assert_pct_domain(r["ownership_pct"], field="ownership_pct", context="t") for r in real)
+        serv = _by(ctx.clean.rows, "2025-03-31", "SERV")
+        assert (serv["action"], serv["shares_delta"], serv["ownership_pct"]) == ("sell", -550_000.0, 13.1)
+
+    return fires, silent
+
+
+@defect(
+    "dollar_only_name_flow_and_dietz",
+    ("dietz_sane",),
+    "dietz_return 19.52 (1,952%) written into returns_by_period.csv at 2024-12-31",
+)
+def _dietz_sane():
+    def fires(ctx: Ctx):
+        out = ctx.export_copy()
+
+        def inject(df):
+            df.loc[df["period_end"].str[:10] == "2024-12-31", "dietz_return"] = "19.52"
+            return df
+
+        _edit_csv(out / f"{SLUG}_returns_by_period.csv", inject)
+        res = precheck(ctx.grade, out)
+        assert res["checks"]["dietz_sane"] == "fail"
+        d = next(i for i in res["minor_issues"] if i["id"] == "dietz_sane")
+        assert d["evidence"] == ["2024-12-31: 1952.0%"]
+        assert res["verdict"] == "needs_work"
+        assert "BOARD: NEEDS_WORK" in run_grade(ctx.grade, out)[3]
+
+    def silent(ctx: Ctx):
+        r = ctx.clean.csv("returns_by_period").set_index("period_end")
+        assert abs(r.loc["2024-09-30", "net_external_flow"] - 5.0e8) < 1.0
+        assert abs(r.loc["2024-09-30", "mtm_pnl"] - 2.5e8) < 1.0
+        assert r["dietz_return"].dropna().abs().max() < 0.1
+        assert ctx.clean.mech["checks"]["dietz_sane"] == "pass"
+
+    return fires, silent
+
+
+@defect(
+    "board_unknown_check",
+    ("unknown_check_ids", "write_board"),
+    "one mechanical check left at unknown on the clean board",
+)
+def _board_unknown():
+    def fires(ctx: Ctx):
+        mech = json.loads(json.dumps(ctx.clean.mech))
+        mech["checks"]["chart_ranking_sane"] = "unknown"
+        assert ctx.grade.unknown_check_ids([mech]) == ["mechanical:chart_ranking_sane"]
+        text = ctx.grade.write_board(PARENT, ctx.tmp_path, [mech], None).read_text(encoding="utf-8")
+        assert "BOARD: NEEDS_WORK" in text and "BOARD: PASS" not in text
+        assert "- mechanical:chart_ranking_sane" in text
+
+    def silent(ctx: Ctx):
+        assert ctx.grade.unknown_check_ids([ctx.clean.mech]) == []
+        assert "BOARD: PASS" in ctx.clean.board
+
+    return fires, silent
+
+
+@defect(
+    "regex_lint_unanchored",
+    ("unanchored_numeric_regex_hits",),
+    r'a module under hidden_stock/ compiling "(?P<sh>[\d,]+)"',
+)
+def _regex_lint():
+    from test_regex_lint import unanchored_numeric_regex_hits
+
+    def fires(ctx: Ctx):
+        root = ctx.tmp_path / "hidden_stock"
+        (root / "quirks").mkdir(parents=True)
+        (root / "quirks" / "_tmp_gate.py").write_text(
+            'import re\n\nSHARES = re.compile(r"(?P<sh>[\\d,]+)")\n', encoding="utf-8"
+        )
+        hits = unanchored_numeric_regex_hits(root)
+        assert hits == ['hidden_stock/quirks/_tmp_gate.py:3: SHARES = re.compile(r"(?P<sh>[\\d,]+)")']
+
+    def silent(ctx: Ctx):
+        assert unanchored_numeric_regex_hits() == []
+
+    return fires, silent
+
+
+@defect(
+    "13d_event_in_q2_filed_in_45_day_window",
+    ("positions_as_of.by_event",),
+    "SERV 13D: event 2024-04-22, filed 2024-05-08 (before the Q1 13F filed 2024-05-15)",
+)
+def _13d_event_quarter():
+    def _snaps(edgar: FakeEdgar):
+        with (
+            patch.object(sec_13g, "_list_13g_items", return_value=list(edgar.g13_items)),
+            patch.object(
+                sec_13g, "fetch_filing_text",
+                side_effect=lambda _s, _c, _acc, primary: (edgar._doc(primary), "html"),
+            ),
+            patch.object(sec_13g.time, "sleep", return_value=None),
+        ):
+            return sec_13g.collect_13g_period_snapshots(
+                cik=CIK, parent_ticker=PARENT, user_agent="tests", max_filings=10
+            )
+
+    def fires(ctx: Ctx):
+        ordered, _meta = _snaps(ctx.clean.edgar)
+        assert [(t[0], t[1]) for t in ordered] == [("2024-04-22", "2024-05-08"), ("2025-01-15", "2025-01-21")]
+        stale = sec_13g.positions_as_of(ordered, "2024-05-15", by="filing")
+        assert [p["investee_ticker"] for p in stale] == ["SERV"]
+        serv = sorted(
+            (r["period_end"], r["action"], r["shares_held"]) for r in ctx.clean.rows if r["investee_ticker"] == "SERV"
+        )
+        assert serv == [
+            ("2024-06-30", "new", 5_298_833.0),
+            ("2024-09-30", "hold", 5_298_833.0),
+            ("2024-12-31", "hold", 5_298_833.0),
+            ("2025-03-31", "sell", 4_748_833.0),
+        ]
+
+    def silent(ctx: Ctx):
+        ordered, _meta = _snaps(ctx.clean.edgar)
+        assert sec_13g.positions_as_of(ordered, "2024-03-31", by="event") == []
+        assert not [r for r in ctx.clean.rows if r["period_end"] == "2024-03-31" and r["investee_ticker"] == "SERV"]
+
+    return fires, silent
+
+
+@defect(
+    "reconcile_value_not_in_document",
+    ("unreconciled_rows", "reconcile.not_found"),
+    "GRAB 2024-06-30 shares_held changed to 650,000,000 (13F infotable says 600,000,000)",
+)
+def _reconcile_not_found():
+    def fires(ctx: Ctx):
+        out = ctx.export_copy()
+
+        def mutate(df):
+            df.loc[_at(df, "2024-06-30", "GRAB"), "shares_held"] = "650000000.0"
+            return df
+
+        _edit_csv(out / f"{SLUG}_equity_holdings_history.csv", mutate)
+        results, code = run_reconcile(ctx.reconcile_cli, out, ctx.clean.edgar)
+        bad = [r for r in results if r["status"] == "not_found"]
+        assert code == 1
+        assert [(r["period_end"], r["investee_ticker"]) for r in bad] == [("2024-06-30", "GRAB")]
+        assert "missing: shares_held=650,000,000" in bad[0]["detail"]
+        res = precheck(ctx.grade, out)
+        assert res["checks"]["unreconciled_rows"] == "fail"
+        assert "unreconciled_rows" in _issue_ids(res) and res["verdict"] == "fail"
+        assert "BOARD: FAIL" in run_grade(ctx.grade, out)[3]
+
+    def silent(ctx: Ctx):
+        statuses = {r["status"] for r in ctx.clean.reconcile}
+        assert statuses <= {"anchored", "skipped_null"}, statuses
+        anchored = [r for r in ctx.clean.reconcile if r["status"] == "anchored"]
+        assert {r["source_kind"] for r in anchored} == {"10q_investments_table", "10k_investments_table", "13f", "13g"}
+        assert ctx.clean.reconcile_code == 0
+        assert ctx.clean.mech["checks"]["unreconciled_rows"] == "pass"
+
+    return fires, silent
+
+
+def _fake_runner(calls: list):
+    def run(name, packet_text, schema):
+        calls.append(name)
+        return {
+            "judge": name, "verdict": "pass", "score": 100, "blocking_issues": [],
+            "minor_issues": [], "what_looks_good": ["ok"], "checks": {"x": "pass"},
+            "summary": f"{name} ok",
+        }
+
+    return run
+
+
+@defect(
+    "judge_digest_missing_sell_and_hash_skip",
+    ("judge_digest.MISSING", "full_judge_skip_reason", "EXIT_FULL_SKIPPED"),
+    "GRAB 2024-12-31 rows dropped from realized_pnl_qoq.csv; unchanged export re-judged in full mode",
+)
+def _judge_digest():
+    from hidden_stock.quirks.holdings import judge_digest as jd
+
+    def fires(ctx: Ctx):
+        out = ctx.export_copy()
+        _edit_csv(
+            out / f"{SLUG}_realized_pnl_qoq.csv",
+            lambda df: df[~_at(df, "2024-12-31", "GRAB")],
+        )
+        data = jd.build_digest_data(out, SLUG)
+        sells = {(s["period_end"], s["ticker"]): s["realized"] for s in data["sells"]}
+        assert sells[("2024-12-31", "GRAB")] == "MISSING"
+        assert "- 2024-12-31 GRAB sell Δsh=-200000000.0 realized=MISSING" in jd.render_digest(data)
+
+        full = ctx.export_copy("full")
+        calls: list = []
+        code1, info1 = ctx.grade.run_grade(
+            ticker=PARENT, out_dir=full, judges=["fable"], judge_mode="full", llm_runner=_fake_runner(calls)
+        )
+        assert code1 == 0 and calls == ["fable"] and info1["skip_reason"] is None
+        code2, info2 = ctx.grade.run_grade(
+            ticker=PARENT, out_dir=full, judges=["fable"], judge_mode="full", llm_runner=_fake_runner(calls)
+        )
+        assert code2 == ctx.grade.EXIT_FULL_SKIPPED and calls == ["fable"]
+        assert "already judged" in info2["skip_reason"] and info1["content_hash"][:12] in info2["skip_reason"]
+
+    def silent(ctx: Ctx):
+        data = jd.build_digest_data(ctx.clean.out_dir, SLUG)
+        sells = {(s["period_end"], s["ticker"]): s["realized"] for s in data["sells"]}
+        assert sells[("2024-12-31", "GRAB")] == "avg:estimated;fifo:estimated"
+        assert sells[("2025-03-31", "SERV")] == "avg:unknown"
+        assert "MISSING" not in {v.split(":")[0] for v in sells.values()}
+        assert jd.full_judge_skip_reason(ctx.clean.out_dir, SLUG, judge_mode="full", force=False) is None
+
+    return fires, silent
+
+
+@defect(
+    "duplicate_period_ticker",
+    ("aur_one_per_period", "assert_unique_period_ticker"),
+    "a second GRAB row (source=13g) in 2024-06-30",
+)
+def _duplicate_period_ticker():
+    def fires(ctx: Ctx):
+        """The exporter coalesces (pe, ticker) before asserting, so the assert is
+        the backstop for the pre-coalesce era: prove it fires on the raw rows,
+        that the pipeline absorbs the duplicate, and that with coalesce gone
+        both the exporter and the precheck fire."""
+        dup = dict(_by(ctx.clean.rows, "2024-06-30", "GRAB"))
+        dup.update(market_value_usd=None, note="source=13g form=SC 13G")
+        with pytest.raises(ValueError, match=r"duplicate investee_ticker.*2024-06-30/GRAB"):
+            history_mod.assert_unique_period_ticker(ctx.clean.rows + [dup], context="dup")
+        paths = export_rows(ctx.clean.rows + [dup], ctx.tmp_path / "dup_export")
+        hist = pd.read_csv(paths["history"])
+        assert int(_at(hist, "2024-06-30", "GRAB").sum()) == 1
+
+        out = ctx.export_copy()
+
+        def duplicate(df):
+            extra = df[_at(df, "2024-06-30", "GRAB")].copy()
+            extra["market_value_usd"] = ""
+            extra["note"] = "source=13g form=SC 13G"
+            return pd.concat([df, extra], ignore_index=True)
+
+        _edit_csv(out / f"{SLUG}_equity_holdings_history.csv", duplicate)
+        from hidden_stock.quirks.holdings import lookback
+
+        ctx.monkeypatch.setattr(lookback, "coalesce_period_ticker", lambda rows: rows)
+        with pytest.raises(ValueError, match=r"export/TESTCO: duplicate investee_ticker.*2024-06-30/GRAB"):
+            export_rows(ctx.clean.rows + [dup], ctx.tmp_path / "dup_export_no_coalesce")
+        res = precheck(ctx.grade, out)
+        assert res["checks"]["aur_one_per_period"] == "fail"
+        assert "duplicate_ticker_same_period" in _issue_ids(res) and res["verdict"] == "fail"
+
+    def silent(ctx: Ctx):
+        history_mod.assert_unique_period_ticker(ctx.clean.rows, context="clean")
+        assert ctx.clean.mech["checks"]["aur_one_per_period"] == "pass"
+
+    return fires, silent
+
+
+_APPEND_EXIT = object()
+
+
+def _history_mutation(gate: str, issue: str, pe: str, ticker: str, edits: dict, *, verdict="fail"):
+    def fires(ctx: Ctx):
+        out = ctx.export_copy()
+
+        def mutate(df):
+            mask = _at(df, pe, ticker)
+            assert int(mask.sum()) == 1, (pe, ticker)
+            for col, val in edits.items():
+                if val is _APPEND_EXIT:
+                    df.loc[mask, col] = df.loc[mask, col] + "; 13g_exit=1"
+                else:
+                    df.loc[mask, col] = val
+            return df
+
+        _edit_csv(out / f"{SLUG}_equity_holdings_history.csv", mutate)
+        res = precheck(ctx.grade, out)
+        assert res["checks"][gate] == "fail", res["checks"]
+        assert issue in _issue_ids(res)
+        assert res["verdict"] == verdict
+        assert "BOARD: PASS" not in run_grade(ctx.grade, out)[3]
+
+    def silent(ctx: Ctx):
+        assert ctx.clean.mech["checks"][gate] == "pass"
+        assert issue not in _issue_ids(ctx.clean.mech)
+
+    return fires, silent
+
+
+@defect("13g_dollar_invent", ("no_otc_invent_marks",), "SERV 2024-06-30 market_value_usd=25,000,000 with only source=13g")
+def _13g_dollar_invent():
+    return _history_mutation(
+        "no_otc_invent_marks", "beneficial_ownership_used_as_value_source",
+        "2024-06-30", "SERV", {"market_value_usd": "25000000.0"},
+    )
+
+
+@defect("ownership_pct_as_shares", ("no_share_invent",), "SERV 2024-06-30 shares_held=14.6 (== ownership_pct)")
+def _pct_as_shares():
+    return _history_mutation(
+        "no_share_invent", "ownership_pct_stuffed_into_shares_held",
+        "2024-06-30", "SERV", {"shares_held": "14.6"},
+    )
+
+
+@defect("placeholder_exchange_ticker", ("no_placeholder_tickers",), "DIDIY 2023-12-31 re-tickered ANT from the note name")
+def _placeholder_ticker():
+    return _history_mutation(
+        "no_placeholder_tickers", "placeholder_exchange_like_ticker",
+        "2023-12-31", "DIDIY", {"investee_ticker": "ANT", "investee_name": "Ant Group", "cusip": ""},
+    )
+
+
+@defect("false_13g_exit", ("no_false_13g_exit",), "SERV 2024-09-30 note stamped 13g_exit=1 while shares > 0")
+def _false_13g_exit():
+    return _history_mutation(
+        "no_false_13g_exit", "false_13g_exit_positive_stake",
+        "2024-09-30", "SERV", {"note": _APPEND_EXIT},
+    )
+
+
+@defect("public_name_as_private", ("no_private_escape_hatch",), "DIDIY 2023-12-31 hidden as PRIV_DIDI_GLOBAL + ticker=private_note")
+def _public_as_private():
+    return _history_mutation(
+        "no_private_escape_hatch", "public_ticker_misclassified_as_private",
+        "2023-12-31", "DIDIY",
+        {"investee_ticker": "PRIV_DIDI_GLOBAL", "investee_name": "Didi Global", "cusip": "",
+         "note": "source=10q_investments_table; ticker=private_note"},
+    )
+
+
+@defect("overlay_exit_zero_dollar", ("no_overlay_exit_invent",), "SERV 2025-03-31 made an exit with market_value_usd=0.0")
+def _overlay_exit_zero():
+    return _history_mutation(
+        "no_overlay_exit_invent", "overlay_exit_invented_zero",
+        "2025-03-31", "SERV", {"action": "exit", "market_value_usd": "0.0", "shares_held": "0.0"},
+    )
+
+
+@defect("blank_public_ticker", ("no_blank_public_ticker",), "GRAB 2024-06-30 ticker/CUSIP blanked under an unresolvable name")
+def _blank_public_ticker():
+    return _history_mutation(
+        "no_blank_public_ticker", "blank_public_ticker",
+        "2024-06-30", "GRAB", {"investee_ticker": "", "cusip": "", "investee_name": "Zed Robotics Corp"},
+    )
+
+
+@defect(
+    "display_basis_cliff",
+    ("no_display_basis_cliff", "chart_ranking_sane"),
+    "GRAB 2024-09-30 chart cell cut to 20% of the prior quarter, rebounding next quarter",
+)
+def _display_basis_cliff():
+    def fires(ctx: Ctx):
+        out = ctx.export_copy()
+
+        def cliff(df):
+            prev = float(df.loc[df["period_end"] == "2024-06-30", "GRAB"].iloc[0])
+            df.loc[df["period_end"] == "2024-09-30", "GRAB"] = str(round(prev * 0.2, 2))
+            return df
+
+        _edit_csv(out / f"{SLUG}_holdings_qoq_chart.csv", cliff)
+        res = precheck(ctx.grade, out)
+        assert res["checks"]["no_display_basis_cliff"] == "fail"
+        assert res["checks"]["chart_ranking_sane"] == "fail"
+        ev = next(i for i in res["blocking_issues"] if i["id"] == "display_basis_cliff")["evidence"]
+        assert ev and ev[0].startswith("GRAB@2024-09-30")
+        assert res["verdict"] == "fail"
+
+    def silent(ctx: Ctx):
+        assert ctx.clean.mech["checks"]["no_display_basis_cliff"] == "pass"
+        assert ctx.clean.mech["checks"]["chart_ranking_sane"] == "pass"
+        chart = ctx.clean.csv("holdings_qoq_chart")
+        assert list(chart["period_end"]) == GRID
+
+    return fires, silent
+
+
+@defect(
+    "parent_scoped_uber_anchors",
+    ("parent_scoped", "didi_2026_06_30_fv", "grab_aurora_vs_10q"),
+    "same export graded as UBER with a 2026-06-30 DIDIY portfolio row of $1.0B",
+)
+def _parent_scoped():
+    def fires(ctx: Ctx):
+        out = ctx.export_copy()
+        _edit_csv(
+            out / f"{SLUG}_portfolio_by_period.csv",
+            lambda df: pd.concat(
+                [df, pd.DataFrame([{"period_end": "2026-06-30", "investee_ticker": "DIDIY", "market_value_usd": "1000000000.0"}])],
+                ignore_index=True,
+            ),
+        )
+        res = precheck(ctx.grade, out, parent="UBER")
+        assert res["parent"] == "UBER" and res["checks"]["parent_scoped"] == "pass"
+        assert res["checks"]["didi_2026_06_30_fv"] == "fail"
+        assert res["checks"]["grab_aurora_vs_10q"] == "fail"
+        assert "didi_fv_mismatch" in _issue_ids(res) and res["verdict"] == "fail"
+
+    def silent(ctx: Ctx):
+        checks = ctx.clean.mech["checks"]
+        assert ctx.clean.mech["parent"] == PARENT and checks["parent_scoped"] == "pass"
+        assert (checks["didi_2026_06_30_fv"], checks["grab_aurora_vs_10q"]) == ("n/a", "n/a")
+        assert "didi_fv_mismatch" not in _issue_ids(ctx.clean.mech)
+
+    return fires, silent
+
+
+@defect(
+    "mtm_identity_break",
+    ("assert_mtm_identity",),
+    "mtm_pnl at 2024-09-30 shifted by $5 so mtm != end - start - flow",
+)
+def _mtm_identity():
+    def fires(ctx: Ctx):
+        r = ctx.clean.csv("returns_by_period").copy()
+        r.loc[r["period_end"] == "2024-09-30", "mtm_pnl"] += 5.0
+        with pytest.raises(AssertionError, match=r"mtm_identity: period 2024-09-30"):
+            perf_mod.assert_mtm_identity(r)
+
+    def silent(ctx: Ctx):
+        assert perf_mod.assert_mtm_identity(ctx.clean.csv("returns_by_period")) is None
+
+    return fires, silent
+
+
+@pytest.mark.parametrize("case", DEFECTS, ids=[d.id for d in DEFECTS])
+def test_gate_fires_and_stays_silent(case: Defect, clean, grade, reconcile_cli, tmp_path, monkeypatch, caplog):
+    ctx = Ctx(clean, grade, reconcile_cli, tmp_path, monkeypatch, caplog)
+    case.silent(ctx)
+    case.fires(ctx)
+
+
