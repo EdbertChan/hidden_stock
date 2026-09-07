@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gate: a rule/principle edit under ``.cursor/`` must ship with code or a test.
+"""Gate: a rule/principle edit on any agent-rule surface must ship with code or a test.
 
 Why: principles were repeatedly written into ``.cursor/skills/*/SKILL.md`` and
 ``.cursor/rules/*.mdc`` with nothing enforcing them (5ab00d0 added the
@@ -45,7 +45,19 @@ import sys
 
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
-RULE_DOC_GLOBS = (".cursor/skills/*/SKILL.md", ".cursor/rules/*.mdc")
+# Every agent-rule surface, not one harness: Cursor (.cursor/), Claude Code
+# (.claude/, CLAUDE.md), Codex (.codex/, AGENTS.md), and any SKILL.md anywhere.
+RULE_DOC_GLOBS = (
+    "*/SKILL.md",
+    "*.mdc",
+    ".cursor/*",
+    ".claude/*",
+    ".codex/*",
+    "CLAUDE.md",
+    "*/CLAUDE.md",
+    "AGENTS.md",
+    "*/AGENTS.md",
+)
 CODE_GLOBS = ("hidden_stock/*.py", "scripts/*.py", "tests/*.py")
 
 _BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")

@@ -176,3 +176,25 @@ def test_gate_fails_on_real_offender_5ab00d0():
     res = _gate(repo, "5ab00d0~1..5ab00d0")
     assert res.returncode == 1, res.stderr
     assert "principle-assert-invariants-not-last-bug/SKILL.md" in res.stderr
+
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize(
+    "rel",
+    [
+        ".claude/skills/holdings/SKILL.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        ".codex/rules/holdings.md",
+        "skills/holdings/SKILL.md",
+    ],
+)
+def test_gate_is_harness_agnostic(repo: Path, rel: str):
+    """Claude Code, Codex, and bare SKILL.md surfaces are gated like .cursor/."""
+    _write(repo, rel, "# Rules\n\n1. **Never drop** - a sale must always appear.\n")
+    _commit(repo, f"principle in {rel}")
+    res = _gate(repo)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert rel in res.stdout + res.stderr

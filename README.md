@@ -33,7 +33,7 @@ uv run python scripts/grade_holdings_sheet.py --ticker <PARENT> --judges fable,c
 
 ## Git hooks
 
-Rule or principle edits under `.cursor/skills/**/SKILL.md` and `.cursor/rules/*.mdc`
+Rule or principle edits on any agent-rule surface (`SKILL.md`, `*.mdc`, `.cursor/`, `.claude/`, `.codex/`, `CLAUDE.md`, `AGENTS.md`)
 must land with a code or test change in the same commit (CI checks the PR range too).
 Enable the local pre-commit check once per clone:
 
