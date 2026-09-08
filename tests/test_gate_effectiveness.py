@@ -42,6 +42,7 @@ from helpers import as_production_text
 from hidden_stock.quirks.holdings import history as history_mod
 from hidden_stock.quirks.holdings import performance as perf_mod
 from hidden_stock.quirks.holdings import sec_13g
+from hidden_stock.quirks.holdings import validate as validate_mod
 from hidden_stock.quirks.holdings.export import write_csvs
 from hidden_stock.quirks.holdings.history import HISTORY_COLUMNS, build_holdings_history
 from hidden_stock.quirks.holdings.schema import HOLDINGS_COLUMNS
@@ -68,6 +69,8 @@ G13_ITEMS = [
     ("2025-01-21", "SC 13D/A", "0009999999-25-000101", "serv_13da.htm"),
     ("2024-05-08", "SC 13D", "0009999999-24-000101", "serv_13d.htm"),
 ]
+SELF_13D = ("2024-07-15", "SC 13D", "0009999999-24-000102", "legacy_widgets_13d.htm")
+PARENT_NAMES = ["TESTCO HOLDINGS INC", "LEGACY WIDGETS CORP"]
 
 INFOTABLES = {
     "0009999999-24-000011": "testco_13f_2024q1.xml",
@@ -134,6 +137,10 @@ class FakeEdgar:
 
     def get_cik(self, ticker: str) -> str:
         return CIK
+
+    def get_company_names(self, cik: str) -> list[str]:
+        assert cik == CIK
+        return list(PARENT_NAMES)
 
     def list_filings(self, cik, form_types=(), as_of=None, limit=None):
         out = [
@@ -557,6 +564,142 @@ def _dietz_sane():
 
 
 @defect(
+    "self_issuer_13g_under_parent_cik",
+    ("self_issuer_row", "no_self_issuer_row", "assert_no_self_issuer_rows"),
+    "a third-party SC 13D about TESTCO captioned with its former name (Legacy Widgets Corp.), "
+    "no trading symbol, listed under TESTCO's own CIK",
+)
+def _self_issuer_under_parent_cik():
+    def fires(ctx: Ctx):
+        edgar = FakeEdgar(g13_items=[G13_ITEMS[0], SELF_13D, G13_ITEMS[1]])
+        rows, meta = build_history(edgar)
+        assert meta["num_13g_filings"] == 3 and meta["num_13g_self_issuer_filings"] == 1
+        assert meta["num_self_issuer_dropped"] == 0
+        assert [r for r in rows if "widgets" in str(r.get("investee_name") or "").lower()] == []
+        assert sorted({r["investee_ticker"] for r in rows}) == sorted({r["investee_ticker"] for r in ctx.clean.rows})
+
+        parsed = sec_13g.parse_13g_html(_fixture(SELF_13D[3]))
+        assert parsed.get("ticker") is None
+        assert not sec_13g.is_self_issuer(parsed, parent_ticker=PARENT, parent_name_hints=[])
+        assert sec_13g.is_self_issuer(parsed, parent_ticker=PARENT, parent_name_hints=PARENT_NAMES)
+
+        leaked = dict(_by(ctx.clean.rows, "2024-06-30", "SERV"))
+        leaked.update(investee_ticker=None, investee_name="Legacy Widgets Corp.", cusip="52468A104")
+        with pytest.raises(AssertionError, match=r"self_issuer rows for TESTCO.*Legacy Widgets"):
+            validate_mod.assert_no_self_issuer_rows(
+                ctx.clean.rows + [leaked], PARENT, parent_name_hints=PARENT_NAMES, context="t"
+            )
+        kept, dropped = validate_mod.drop_self_issuer_rows(
+            ctx.clean.rows + [leaked], PARENT, parent_name_hints=PARENT_NAMES
+        )
+        assert dropped == [leaked] and len(kept) == len(ctx.clean.rows)
+
+        out = ctx.export_copy()
+        hist_csv = out / f"{SLUG}_equity_holdings_history.csv"
+
+        def add_self_row(df):
+            row = df[_at(df, "2024-06-30", "SERV")].iloc[0].copy()
+            row["investee_ticker"] = ""
+            row["investee_name"] = "Legacy Widgets Corp."
+            row["cusip"] = "52468A104"
+            return pd.concat([df, row.to_frame().T], ignore_index=True)
+
+        _edit_csv(hist_csv, add_self_row)
+        res = ctx.grade.mechanical_precheck(
+            hist_csv, out / f"{SLUG}_portfolio_by_period.csv", parent=PARENT, parent_name_hints=PARENT_NAMES
+        )
+        assert res["checks"]["no_self_issuer_row"] == "fail"
+        hit = next(i for i in res["blocking_issues"] if i["id"] == "self_issuer_row")
+        assert hit["evidence"][0]["investee_name"] == "Legacy Widgets Corp."
+        assert res["verdict"] == "fail"
+        res_cached = precheck(ctx.grade, out)
+        assert res_cached["checks"]["no_self_issuer_row"] == "fail", "cached EDGAR names not used"
+        assert "BOARD: FAIL" in run_grade(ctx.grade, out)[3]
+
+        _edit_csv(
+            hist_csv,
+            lambda df: df.assign(
+                investee_ticker=df["investee_ticker"].where(df["investee_name"] != "Legacy Widgets Corp.", PARENT)
+            ),
+        )
+        res = ctx.grade.mechanical_precheck(
+            hist_csv, out / f"{SLUG}_portfolio_by_period.csv", parent=PARENT, parent_name_hints=[]
+        )
+        assert "investee_ticker=TESTCO is the parent" in str(
+            next(i for i in res["blocking_issues"] if i["id"] == "self_issuer_row")["evidence"]
+        )
+
+    def silent(ctx: Ctx):
+        assert ctx.clean.meta["num_13g_self_issuer_filings"] == 0
+        assert ctx.clean.meta["num_self_issuer_dropped"] == 0
+        assert ctx.clean.mech["checks"]["no_self_issuer_row"] == "pass"
+        assert "self_issuer_row" not in _issue_ids(ctx.clean.mech)
+        assert validate_mod.assert_no_self_issuer_rows(
+            ctx.clean.rows, PARENT, parent_name_hints=PARENT_NAMES
+        ) is None
+        assert sec_13g.parent_name_hints_for(PARENT) == PARENT_NAMES
+
+    return fires, silent
+
+
+@defect(
+    "empty_export_unexplained",
+    ("empty_export_unexplained", "empty_export_explained", "empty_export_note"),
+    "a parent whose only 13D/G under its CIK is a third party's stake in the parent: "
+    "zero rows after filtering, exported with no export_status note",
+)
+def _empty_export_unexplained():
+    from hidden_stock.quirks.holdings import export as export_mod
+
+    def fires(ctx: Ctx):
+        edgar = FakeEdgar(g13_items=[SELF_13D], note_filings=[])
+        rows, meta = build_history(edgar, f13=[])
+        assert rows == [] and meta["num_13g_self_issuer_filings"] == 1
+        note = export_mod.empty_export_note(PARENT, num_current=0, num_history=0, build_meta=meta)
+        assert note.startswith(
+            f"no named public equity stakes disclosed via 13F/13G/notes for {PARENT}; "
+            "13G filings under the CIK were third-party filings about the parent: 1"
+        )
+        assert "13G filings scanned: 1" in note
+        assert export_mod.empty_export_note(PARENT, num_current=0, num_history=0) is not None
+
+        empty_hold = pd.DataFrame(columns=HOLDINGS_COLUMNS)
+        empty_hist = pd.DataFrame(rows, columns=HISTORY_COLUMNS)
+        out = ctx.tmp_path / "empty_silent"
+        paths = write_csvs(PARENT, empty_hold, empty_hist, out)
+        assert "export_status" not in paths
+        res = precheck(ctx.grade, out)
+        assert res["checks"]["empty_export_explained"] == "fail"
+        assert "empty_export_unexplained" in _issue_ids(res)
+        assert res["verdict"] == "fail"
+        assert "BOARD: FAIL" in run_grade(ctx.grade, out)[3]
+
+        explained = ctx.tmp_path / "empty_explained"
+        paths = write_csvs(PARENT, empty_hold, empty_hist, explained, status_note=note, build_meta=meta)
+        status = pd.read_csv(paths["export_status"])
+        assert status["note"].iloc[0] == note and int(status["num_13g_self_issuer_filings"].iloc[0]) == 1
+        res = precheck(ctx.grade, explained)
+        assert res["checks"]["empty_export_explained"] == "pass"
+        assert res["checks"]["no_self_issuer_row"] == "pass", "zero rows must resolve, not stay unknown"
+        assert "empty_export_unexplained" not in _issue_ids(res)
+        assert meta["num_self_issuer_dropped"] == 0
+        assert "empty_export_unexplained" not in run_grade(ctx.grade, explained)[3]
+
+        paths = write_csvs(PARENT, empty_hold, empty_hist, explained)
+        assert not (explained / f"{SLUG}_export_status.csv").is_file(), "stale status note kept"
+
+    def silent(ctx: Ctx):
+        assert ctx.clean.mech["checks"]["empty_export_explained"] == "pass"
+        assert "empty_export_unexplained" not in _issue_ids(ctx.clean.mech)
+        assert export_mod.empty_export_note(
+            PARENT, num_current=0, num_history=len(ctx.clean.rows), build_meta=ctx.clean.meta
+        ) is None
+        assert not (ctx.clean.out_dir / f"{SLUG}_export_status.csv").is_file()
+
+    return fires, silent
+
+
+@defect(
     "board_unknown_check",
     ("unknown_check_ids", "write_board"),
     "one mechanical check left at unknown on the clean board",
@@ -806,20 +949,53 @@ def _history_mutation(gate: str, issue: str, pe: str, ticker: str, edits: dict, 
     return fires, silent
 
 
-@defect("13g_dollar_invent", ("no_otc_invent_marks",), "SERV 2024-06-30 market_value_usd=25,000,000 with only source=13g")
+@defect(
+    "13g_dollar_invent",
+    ("no_otc_invent_marks", "assert_estimates_not_in_market_value"),
+    "SERV 2024-06-30 market_value_usd=25,000,000 with only source=13g",
+)
 def _13g_dollar_invent():
-    return _history_mutation(
+    fires_csv, silent_csv = _history_mutation(
         "no_otc_invent_marks", "beneficial_ownership_used_as_value_source",
         "2024-06-30", "SERV", {"market_value_usd": "25000000.0"},
     )
 
+    def fires(ctx: Ctx):
+        fires_csv(ctx)
+        est = dict(_by(ctx.clean.rows, "2024-06-30", "SERV"))
+        est.update(market_value_usd=25e6, note=f"{est.get('note') or ''}; value_estimate=eod_at_filing")
+        with pytest.raises(AssertionError, match=r"eod_estimate_as_market_value"):
+            validate_mod.assert_estimates_not_in_market_value([est], context="t")
 
-@defect("ownership_pct_as_shares", ("no_share_invent",), "SERV 2024-06-30 shares_held=14.6 (== ownership_pct)")
+    def silent(ctx: Ctx):
+        silent_csv(ctx)
+        assert validate_mod.assert_estimates_not_in_market_value(ctx.clean.rows, context="t") is None
+
+    return fires, silent
+
+
+@defect(
+    "ownership_pct_as_shares",
+    ("no_share_invent", "assert_live_shares_held_sane"),
+    "SERV 2024-06-30 shares_held=14.6 (== ownership_pct)",
+)
 def _pct_as_shares():
-    return _history_mutation(
+    fires_csv, silent_csv = _history_mutation(
         "no_share_invent", "ownership_pct_stuffed_into_shares_held",
         "2024-06-30", "SERV", {"shares_held": "14.6"},
     )
+
+    def fires(ctx: Ctx):
+        fires_csv(ctx)
+        stuffed = dict(_by(ctx.clean.rows, "2024-06-30", "SERV"), shares_held=14.6, ownership_pct=14.6)
+        with pytest.raises(ValueError, match=r"shares_held=14.6 == ownership_pct=14.6"):
+            validate_mod.assert_live_shares_held_sane([stuffed])
+
+    def silent(ctx: Ctx):
+        silent_csv(ctx)
+        assert validate_mod.assert_live_shares_held_sane(ctx.clean.rows) is None
+
+    return fires, silent
 
 
 @defect("placeholder_exchange_ticker", ("no_placeholder_tickers",), "DIDIY 2023-12-31 re-tickered ANT from the note name")
@@ -959,7 +1135,7 @@ def registered_precheck_ids(grade_src: str, clean_checks: dict) -> set[str]:
 
 def exported_assert_functions() -> set[str]:
     out: set[str] = set()
-    for mod in (perf_mod, history_mod):
+    for mod in (perf_mod, history_mod, validate_mod):
         out |= {n for n, obj in vars(mod).items() if n.startswith("assert_") and inspect.isfunction(obj)}
     return out
 

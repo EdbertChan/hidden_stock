@@ -1041,6 +1041,17 @@ def build_13f_history(
     return history, meta
 
 
+def _without_self_issuer_rows(
+    history: list[dict], parent: str, hints: list[str], meta: dict[str, Any]
+) -> list[dict]:
+    """Defense in depth after the collectors: no row may be the parent itself."""
+    from .validate import drop_self_issuer_rows
+
+    kept, dropped = drop_self_issuer_rows(history, parent, parent_name_hints=hints)
+    meta["num_self_issuer_dropped"] = len(dropped)
+    return kept
+
+
 def build_holdings_history(
     *,
     parent_ticker: str,
@@ -1055,13 +1066,20 @@ def build_holdings_history(
     from .lookback import date_on_or_after, lookback_start_date
     from .parents import history_strategy, normalize_parent, uses_hk_aggregates
     from .runner import PARENT_CIK_OVERRIDES
-    from .sec_13g import collect_13g_period_snapshots, exited_tickers_as_of, positions_as_of
+    from .sec_13g import (
+        collect_13g_period_snapshots,
+        exited_tickers_as_of,
+        parent_name_hints_for,
+        positions_as_of,
+    )
 
     parent = normalize_parent(parent_ticker)
     strategy = history_strategy(parent)
     ua = getattr(edgar, "user_agent", None) or ""
     cik = PARENT_CIK_OVERRIDES.get(parent) or edgar.get_cik(parent)
+    hints = parent_name_hints_for(parent, edgar=edgar, cik=cik)
     start = lookback_start_date(as_of=as_of, lookback_years=lookback_years)
+    meta_defaults = {"num_13g_self_issuer_filings": 0, "num_self_issuer_dropped": 0}
     if max_annual_filings is None:
         # lookback_years=0 means the whole book: do not cap notes at 3 years.
         max_annual_filings = 400 if int(lookback_years) <= 0 else max(12, int(lookback_years) * 4)
@@ -1075,10 +1093,14 @@ def build_holdings_history(
             user_agent=ua,
             max_filings=max(max_filings, 120),
             lookback_start=start,
+            parent_name_hints=hints,
         )
         meta["strategy"] = strategy
         meta["lookback_start"] = start
         meta["lookback_years"] = lookback_years
+        for k, v in meta_defaults.items():
+            meta.setdefault(k, v)
+        hist = _without_self_issuer_rows(hist, parent, hints, meta)
         return stamp_filing_urls(price_history_rows(hist), cik=cik), meta
 
     ordered, meta = _collect_13f_periods(
@@ -1088,6 +1110,8 @@ def build_holdings_history(
         max_filings=max_filings,
         lookback_start=start,
     )
+    for k, v in meta_defaults.items():
+        meta.setdefault(k, v)
     meta["strategy"] = strategy
     meta["lookback_start"] = start
     meta["lookback_years"] = lookback_years
@@ -1125,6 +1149,7 @@ def build_holdings_history(
 
     g13_snaps: list[tuple[str, str, str, list[dict]]] = []
     exited_by_date: dict[str, list[str]] = {}
+    meta["num_13g_self_issuer_filings"] = 0
     if cik:
         g13_snaps, g_meta = collect_13g_period_snapshots(
             cik=cik,
@@ -1132,9 +1157,11 @@ def build_holdings_history(
             user_agent=ua,
             max_filings=max(max_filings, 80),
             lookback_start=start,
+            parent_name_hints=hints,
         )
         meta["num_13g_filings"] = g_meta.get("num_filings")
         meta["num_13g_periods"] = g_meta.get("num_periods")
+        meta["num_13g_self_issuer_filings"] = g_meta.get("num_self_issuer_filings", 0)
         exited_by_date = dict(g_meta.get("exited_by_date") or {})
         if g_meta.get("error"):
             meta["13g_error"] = g_meta["error"]
@@ -1149,7 +1176,7 @@ def build_holdings_history(
             )
             meta["grid"] = "13g"
             meta["num_periods"] = len(g13_snaps)
-            return history, meta
+            return _without_self_issuer_rows(history, parent, hints, meta), meta
         meta["error"] = meta.get("error") or "no 13F or 13G periods"
         return [], meta
 
@@ -1210,6 +1237,7 @@ def build_holdings_history(
     history = stamp_filing_urls(price_history_rows(diff_snapshots(parent, enriched)), cik=cik)
     if truncated:
         history = stamp_truncated_notes(history, truncated)
+    history = _without_self_issuer_rows(history, parent, hints, meta)
     meta["grid"] = "13f"
     meta["num_note_history_rows"] = sum(
         1

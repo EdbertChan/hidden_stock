@@ -1,11 +1,67 @@
+import json
+import logging
 import time
+from pathlib import Path
 
 import dagster as dg
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
+_log = logging.getLogger(__name__)
+
 _TICKER_CIK_CACHE: dict[str, str] | None = None
+
+COMPANY_NAMES_CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache" / "edgar_company_names"
+_COMPANY_NAMES_CACHE: dict[str, dict] = {}
+
+
+def _company_names_record(payload: dict, cik: str) -> dict:
+    names: list[str] = []
+    current = str(payload.get("name") or "").strip()
+    if current:
+        names.append(current)
+    for former in payload.get("formerNames") or []:
+        n = str((former or {}).get("name") or "").strip()
+        if n and n not in names:
+            names.append(n)
+    tickers = [str(t).strip().upper() for t in (payload.get("tickers") or []) if str(t).strip()]
+    return {"cik": cik, "names": names, "tickers": tickers}
+
+
+def _read_company_names_disk(path: Path) -> dict | None:
+    if not path.is_file():
+        return None
+    try:
+        rec = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        _log.warning("edgar company-names cache unreadable at %s: %s", path, e)
+        return None
+    if not isinstance(rec, dict) or not isinstance(rec.get("names"), list):
+        _log.warning("edgar company-names cache malformed at %s; refetching", path)
+        return None
+    return rec
+
+
+def cached_company_names_for_ticker(ticker: str) -> list[str]:
+    """EDGAR names for a parent from the on-disk cache only (no network).
+
+    Lets a separate process (the grade CLI) reuse names an export already
+    fetched. Empty when nothing cached for that ticker.
+    """
+    want = str(ticker or "").strip().upper()
+    if not want:
+        return []
+    for rec in _COMPANY_NAMES_CACHE.values():
+        if want in rec.get("tickers", []):
+            return list(rec["names"])
+    if not COMPANY_NAMES_CACHE_DIR.is_dir():
+        return []
+    for path in sorted(COMPANY_NAMES_CACHE_DIR.glob("CIK*.json")):
+        rec = _read_company_names_disk(path)
+        if rec and want in rec.get("tickers", []):
+            return list(rec["names"])
+    return []
 
 
 def _load_ticker_cik_map(session: requests.Session) -> dict[str, str]:
@@ -35,6 +91,34 @@ class EdgarResource(dg.ConfigurableResource):
         session = self._session()
         mapping = _load_ticker_cik_map(session)
         return mapping.get(ticker.upper())
+
+    def get_company_names(self, cik: str) -> list[str]:
+        """Current EDGAR ``name`` plus every ``formerNames`` entry for a CIK.
+
+        Used to recognise third-party 13D/13G filings *about* the parent that
+        EDGAR lists under the parent's own CIK (PDD's were captioned
+        "Pinduoduo Inc.", a former name). Cached in-process and under the
+        gitignored ``.cache/edgar_company_names/`` so reruns are free.
+        """
+        padded = str(cik).zfill(10)
+        rec = _COMPANY_NAMES_CACHE.get(padded)
+        if rec is None:
+            rec = _read_company_names_disk(COMPANY_NAMES_CACHE_DIR / f"CIK{padded}.json")
+        if rec is None:
+            session = self._session()
+            time.sleep(0.15)
+            resp = session.get(f"https://data.sec.gov/submissions/CIK{padded}.json", timeout=15)
+            resp.raise_for_status()
+            rec = _company_names_record(resp.json(), padded)
+            try:
+                COMPANY_NAMES_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                (COMPANY_NAMES_CACHE_DIR / f"CIK{padded}.json").write_text(
+                    json.dumps(rec, indent=2), encoding="utf-8"
+                )
+            except OSError as e:
+                _log.warning("could not write edgar company-names cache for %s: %s", padded, e)
+        _COMPANY_NAMES_CACHE[padded] = rec
+        return list(rec["names"])
 
     def get_latest_filing(
         self,

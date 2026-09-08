@@ -105,10 +105,13 @@ def mechanical_precheck(
     portfolio_csv: Path,
     *,
     parent: str,
+    parent_name_hints: list[str] | None = None,
 ) -> dict:
     """Pandas checks that must not wait for an LLM judge (SERV-class bugs).
 
     Parent-scoped: Uber 10-Q DIDIY/GRAB/AUR anchors apply **only** when parent is UBER.
+    ``parent_name_hints`` (EDGAR current + former names) feeds the self-issuer
+    check; when omitted it uses whatever an export already cached.
     """
     parent_u = str(parent or "").strip().upper()
     issues: list[dict] = []
@@ -547,6 +550,69 @@ def mechanical_precheck(
             checks["no_blank_public_ticker"] = "fail"
         else:
             checks["no_blank_public_ticker"] = "pass"
+
+    checks.setdefault("no_self_issuer_row", "unknown")
+    if len(hist) == 0 or "investee_ticker" in hist.columns or "investee_name" in hist.columns:
+        from hidden_stock.quirks.holdings.validate import self_issuer_row_reason
+
+        hints = list(parent_name_hints or [])
+        if not hints:
+            from hidden_stock.quirks.holdings.sec_13g import known_parent_name_hints
+
+            hints = known_parent_name_hints(parent_u)
+        self_rows = []
+        for r in hist.to_dict(orient="records"):
+            reason = self_issuer_row_reason(r, parent_u, hints)
+            if reason:
+                self_rows.append(
+                    {
+                        "period_end": r.get("period_end"),
+                        "investee_ticker": r.get("investee_ticker"),
+                        "investee_name": r.get("investee_name"),
+                        "reason": reason,
+                    }
+                )
+        if self_rows:
+            issues.append(
+                {
+                    "id": "self_issuer_row",
+                    "severity": (
+                        "history row is the parent holding itself: third-party 13D/G "
+                        "about the parent under its own CIK (PDD/Pinduoduo class)"
+                    ),
+                    "evidence": self_rows[:8],
+                }
+            )
+            checks["no_self_issuer_row"] = "fail"
+        else:
+            checks["no_self_issuer_row"] = "pass"
+
+    checks.setdefault("empty_export_explained", "unknown")
+    if len(hist):
+        checks["empty_export_explained"] = "pass"
+    else:
+        status_csv = history_csv.parent / f"{parent_u.lower().replace('-', '')}_export_status.csv"
+        note = ""
+        if status_csv.is_file():
+            status = pd.read_csv(status_csv)
+            if "note" in status.columns and len(status):
+                note = str(status["note"].iloc[0] or "").strip()
+        if note and note.lower() not in {"nan", "none"}:
+            checks["empty_export_explained"] = "pass"
+        else:
+            issues.append(
+                {
+                    "id": "empty_export_unexplained",
+                    "severity": (
+                        "history has zero rows and no export_status note says why "
+                        "(silent empty book; expected e.g. 'no named public equity stakes "
+                        "disclosed via 13F/13G/notes for <parent>; 13G filings under the CIK "
+                        "were third-party filings about the parent: N')"
+                    ),
+                    "evidence": str(status_csv),
+                }
+            )
+            checks["empty_export_explained"] = "fail"
 
     checks.setdefault("unreconciled_rows", "unknown")
     reconcile_csv = history_csv.parent / f"{parent_u.lower().replace('-', '')}_reconcile.csv"

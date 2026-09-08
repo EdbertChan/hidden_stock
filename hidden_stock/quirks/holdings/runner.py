@@ -18,7 +18,7 @@ from .mtm import apply_gaap_and_adj
 from .parse_notes import parse_investment_notes
 from .parents import normalize_parent, uses_hk_aggregates
 from .schema import HOLDINGS_COLUMNS, empty_holding_row
-from .sec_13g import fetch_latest_13g_holdings
+from .sec_13g import fetch_latest_13g_holdings, parent_name_hints_for
 from .sec_api_13f import latest_filer_13f_rows
 
 PARENT_CIK_OVERRIDES: dict[str, str] = {
@@ -232,7 +232,8 @@ def process_parent_holdings(
         from .tencent import build_tencent_holdings
 
         ua = getattr(edgar, "user_agent", None) or ""
-        return build_tencent_holdings(user_agent=ua)
+        hints = parent_name_hints_for(parent, edgar=edgar, cik=PARENT_CIK_OVERRIDES.get(parent))
+        return build_tencent_holdings(user_agent=ua, parent_name_hints=hints)
 
     meta: dict[str, Any] = {
         "parent_ticker": parent,
@@ -272,13 +273,19 @@ def process_parent_holdings(
         meta["13f_error"] = str(e)
 
     # --- Schedule 13D/G ---
+    hints = parent_name_hints_for(parent, edgar=edgar, cik=cik)
     try:
         ua = getattr(edgar, "user_agent", None) or ""
         raw_13g, g_meta = fetch_latest_13g_holdings(
-            cik=cik, parent_ticker=parent, user_agent=ua, max_filings=40
+            cik=cik,
+            parent_ticker=parent,
+            user_agent=ua,
+            max_filings=40,
+            parent_name_hints=hints,
         )
         meta["num_13g"] = len(raw_13g)
         meta["13g_filings_scanned"] = g_meta.get("num_filings_scanned")
+        meta["13g_self_issuer_filings"] = g_meta.get("num_self_issuer_filings", 0)
         if g_meta.get("error"):
             meta["13g_error"] = g_meta["error"]
     except Exception as e:
@@ -326,7 +333,12 @@ def process_parent_holdings(
     meta["num_notes"] = len(raw_notes)
     meta["notes_filings_scanned"] = len(annuals)
 
-    merged = merge_raw_holdings([raw_13f, raw_13g, raw_notes])
+    from .validate import drop_self_issuer_rows
+
+    merged, self_rows = drop_self_issuer_rows(
+        merge_raw_holdings([raw_13f, raw_13g, raw_notes]), parent, parent_name_hints=hints
+    )
+    meta["num_self_issuer_dropped"] = len(self_rows)
     meta["num_raw"] = len(merged)
 
     if use_llm_fallback and not merged and filing and llm is not None:

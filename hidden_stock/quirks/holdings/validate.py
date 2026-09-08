@@ -2,6 +2,72 @@
 
 from __future__ import annotations
 
+import logging
+
+from .identity import name_matches_parent_hints
+
+_log = logging.getLogger(__name__)
+
+
+def self_issuer_row_reason(row: dict, parent: str, parent_name_hints=None) -> str | None:
+    """Why ``row`` is the parent holding itself, or None when it is a real stake.
+
+    A third-party 13D/G *about* the parent (listed under the parent's CIK)
+    must never become a holding row: investee ticker == parent, or the
+    investee name is one of the parent's EDGAR names (current or former).
+    """
+    parent_u = str(parent or "").strip().upper()
+    if not parent_u:
+        return None
+    ticker = str(row.get("investee_ticker") or "").strip().upper()
+    if ticker and ticker not in {"NAN", "NONE"} and ticker == parent_u:
+        return f"investee_ticker={ticker} is the parent"
+    name = row.get("investee_name")
+    if isinstance(name, float) or not name:
+        return None
+    hints = list(parent_name_hints or []) + [parent_u, parent_u.replace("-", " ")]
+    if name_matches_parent_hints(str(name), hints):
+        return f"investee_name={name!r} is a parent name"
+    return None
+
+
+def drop_self_issuer_rows(
+    rows: list[dict], parent: str, *, parent_name_hints=None
+) -> tuple[list[dict], list[dict]]:
+    """Split rows into (kept, dropped-as-self-issuer); logs every drop."""
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    for r in rows:
+        reason = self_issuer_row_reason(r, parent, parent_name_hints)
+        if reason:
+            _log.warning(
+                "%s: dropping self-issuer row (%s) period=%s acc=%s",
+                parent,
+                reason,
+                r.get("period_end") or r.get("as_of_date"),
+                r.get("accession_no") or r.get("as_of_accession_no"),
+            )
+            dropped.append(r)
+        else:
+            kept.append(r)
+    return kept, dropped
+
+
+def assert_no_self_issuer_rows(
+    rows: list[dict], parent: str, *, parent_name_hints=None, context: str = ""
+) -> None:
+    """Refuse-to-ship: no row may describe the parent holding itself (PDD class)."""
+    bad: list[str] = []
+    for r in rows:
+        reason = self_issuer_row_reason(r, parent, parent_name_hints)
+        if reason:
+            bad.append(f"{r.get('period_end') or r.get('as_of_date')}: {reason}")
+    if bad:
+        raise AssertionError(
+            f"self_issuer rows for {parent} ({context}): third-party 13D/G about the "
+            f"parent leaked into holdings — {bad[:8]}"
+        )
+
 
 def _f(v) -> float | None:
     if v is None or v == "":

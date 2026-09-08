@@ -112,6 +112,8 @@ def main() -> int:
     )
     result["strategy"] = strategy
     print(json.dumps(result, indent=2))
+    if result.get("status_note"):
+        print(f"\nEMPTY EXPORT: {result['status_note']}", file=sys.stderr)
     if result.get("sheets", {}).get("url"):
         print(f"\nSheet: {result['sheets']['url']}", file=sys.stderr)
         print(f"History strategy: {strategy}", file=sys.stderr)

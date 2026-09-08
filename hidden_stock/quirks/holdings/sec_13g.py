@@ -16,6 +16,7 @@ from .identity import (
     assert_pct_domain,
     clean_issuer_name,
     holding_key,
+    name_matches_parent_hints,
     resolve_issuer_ticker,
 )
 
@@ -342,33 +343,113 @@ def parse_13g_html(html_text: str) -> dict:
     return out
 
 
+_PARENT_NAME_HINTS: dict[str, list[str]] = {}
+
+
+def clear_parent_name_hints() -> None:
+    """Drop the in-process parent-name cache (tests / forced re-resolve)."""
+    _PARENT_NAME_HINTS.clear()
+
+
+def parent_name_hints_for(
+    parent_ticker: str,
+    edgar=None,
+    *,
+    cik: str | None = None,
+) -> list[str]:
+    """EDGAR current + former names for a parent, cached per process.
+
+    Resolves through ``edgar.get_company_names`` (any object with that
+    surface; tests inject a fake) and never touches the network on its own:
+    with no ``edgar`` it returns what is already cached, else ``[]``. Failures
+    are logged and yield ``[]`` so the ticker-equality check still applies.
+    """
+    parent = (parent_ticker or "").strip().upper()
+    if not parent:
+        return []
+    cached = _PARENT_NAME_HINTS.get(parent)
+    if cached is not None:
+        return list(cached)
+    if edgar is None or not hasattr(edgar, "get_company_names"):
+        return []
+    resolved_cik = cik
+    if not resolved_cik and hasattr(edgar, "get_cik"):
+        try:
+            resolved_cik = edgar.get_cik(parent)
+        except Exception as e:
+            _log.warning("parent_name_hints_for: CIK lookup failed for %s: %s", parent, e)
+            return []
+    if not resolved_cik:
+        _log.warning("parent_name_hints_for: no CIK for %s; name hints unavailable", parent)
+        return []
+    try:
+        names = [str(n) for n in (edgar.get_company_names(resolved_cik) or []) if n]
+    except Exception as e:
+        _log.warning(
+            "parent_name_hints_for: EDGAR names unavailable for %s (cik %s): %s",
+            parent,
+            resolved_cik,
+            e,
+        )
+        return []
+    _PARENT_NAME_HINTS[parent] = names
+    return list(names)
+
+
+def known_parent_name_hints(parent_ticker: str) -> list[str]:
+    """Names already resolved for a parent: in-process cache, then the on-disk
+    EDGAR cache written by an earlier export. Never fetches; ``[]`` otherwise.
+    Used by export/grade paths that have no EDGAR client in hand."""
+    hints = parent_name_hints_for(parent_ticker)
+    if hints:
+        return hints
+    from hidden_stock.resources.edgar_resource import cached_company_names_for_ticker
+
+    return cached_company_names_for_ticker(parent_ticker)
+
+
 def is_self_issuer(
     parsed: dict,
     *,
     parent_ticker: str,
     parent_name_hints: list[str] | None = None,
 ) -> bool:
-    """True when the filing's issuer is the parent (third-party 13G on the parent)."""
+    """True when the filing's issuer is the parent (third-party 13D/G on the parent).
+
+    Ticker equality first; then the issuer name against ``parent_name_hints``
+    (EDGAR current + former names via ``parent_name_hints_for``) and the
+    ticker itself, on normalized stems — no per-stock name list.
+    """
     parent = (parent_ticker or "").strip().upper()
     ticker = (parsed.get("ticker") or "").strip().upper()
     if parent and ticker and ticker == parent:
         return True
-    name = (parsed.get("issuer_name") or "").strip().lower()
+    hints = [h for h in (parent_name_hints or []) if h]
+    if parent:
+        hints.extend([parent, parent.replace("-", " ")])
+    return name_matches_parent_hints(parsed.get("issuer_name"), hints)
+
+
+def _is_self_issuer_filing(
+    parsed: dict,
+    *,
+    parent_ticker: str,
+    parent_name_hints: list[str] | None,
+) -> bool:
+    """Self-issuer check on the cleaned name and the *resolved* ticker.
+
+    The cover page often carries no trading symbol; resolving the name via
+    the shared alias tables makes ``"Pinduoduo Inc."`` → ``PDD`` == parent.
+    """
+    if is_self_issuer(parsed, parent_ticker=parent_ticker, parent_name_hints=parent_name_hints):
+        return True
+    name = clean_issuer_name(parsed.get("issuer_name")) or parsed.get("issuer_name")
     if not name:
         return False
-    hints = [h.lower() for h in (parent_name_hints or []) if h]
-    # Default: ticker as word + common expansions
-    hints.extend([parent.lower(), parent.replace("-", " ").lower()])
-    if parent == "UBER":
-        hints.append("uber technologies")
-    if parent in {"BRK-B", "BRK.B", "BRKB"}:
-        hints.append("berkshire hathaway")
-    if parent == "BABA":
-        hints.append("alibaba")
-    for h in hints:
-        if h and h in name:
-            return True
-    return False
+    cusip = (parsed.get("cusip") or "").strip().upper() or None
+    resolved = resolve_issuer_ticker(name, parsed.get("ticker"), cusip=cusip)
+    parent = (parent_ticker or "").strip().upper()
+    return bool(parent and resolved and str(resolved).strip().upper() == parent)
 
 
 def raw_to_live_row(
@@ -379,12 +460,17 @@ def raw_to_live_row(
     acc: str,
     filing_date: str,
     cik: str,
+    parent_name_hints: list[str] | None = None,
 ) -> dict | None:
     name = parsed.get("issuer_name")
     if not name:
         return None
     name = clean_issuer_name(name) or name
-    if is_self_issuer(parsed, parent_ticker=parent_ticker):
+    if parent_name_hints is None:
+        parent_name_hints = parent_name_hints_for(parent_ticker)
+    if _is_self_issuer_filing(
+        parsed, parent_ticker=parent_ticker, parent_name_hints=parent_name_hints
+    ):
         return None
     cusip = (parsed.get("cusip") or "").strip().upper() or None
     ticker = resolve_issuer_ticker(name, parsed.get("ticker"), cusip=cusip)
@@ -435,6 +521,7 @@ def raw_to_position(
     acc: str,
     filing_date: str,
     cik: str,
+    parent_name_hints: list[str] | None = None,
 ) -> dict | None:
     """QoQ snapshot row shape.
 
@@ -448,6 +535,7 @@ def raw_to_position(
         acc=acc,
         filing_date=filing_date,
         cik=cik,
+        parent_name_hints=parent_name_hints,
     )
     if not live:
         return None
@@ -572,14 +660,23 @@ def fetch_latest_13g_holdings(
     parent_ticker: str,
     user_agent: str,
     max_filings: int = 40,
+    parent_name_hints: list[str] | None = None,
 ) -> tuple[list[dict], dict[str, Any]]:
-    """Latest Schedule 13D/G subjects for filer CIK (issuer ≠ parent)."""
+    """Latest Schedule 13D/G subjects for filer CIK (issuer ≠ parent).
+
+    Newest-first scan: once an issuer exits, older filings cannot re-add it.
+    ``meta["num_self_issuer_filings"]`` counts filings skipped because their
+    issuer *is* the parent (third-party 13D/G listed under the parent's CIK).
+    """
     meta: dict[str, Any] = {
         "cik": cik,
         "num_filings_scanned": 0,
         "num_parsed": 0,
+        "num_self_issuer_filings": 0,
         "error": None,
     }
+    if parent_name_hints is None:
+        parent_name_hints = parent_name_hints_for(parent_ticker)
     session = requests.Session()
     session.headers.update({"User-Agent": user_agent or "hidden_stock research"})
     try:
@@ -590,7 +687,6 @@ def fetch_latest_13g_holdings(
 
     meta["num_filings_scanned"] = len(items)
     by_issuer: dict[str, dict] = {}
-    # Newest-first scan: once an issuer exits, ignore older filings that would re-add it.
     exited_issuers: set[str] = set()
     for filing_date, form, acc, primary in items:
         time.sleep(0.08)
@@ -602,6 +698,11 @@ def fetch_latest_13g_holdings(
         except Exception:
             continue
         meta["num_parsed"] += 1
+        if _is_self_issuer_filing(
+            parsed, parent_ticker=parent_ticker, parent_name_hints=parent_name_hints
+        ):
+            meta["num_self_issuer_filings"] += 1
+            continue
         row = raw_to_live_row(
             parsed,
             parent_ticker=parent_ticker,
@@ -609,6 +710,7 @@ def fetch_latest_13g_holdings(
             acc=acc,
             filing_date=filing_date,
             cik=cik,
+            parent_name_hints=parent_name_hints,
         )
         if not row:
             continue
@@ -641,6 +743,7 @@ def collect_13g_period_snapshots(
     user_agent: str,
     max_filings: int = 80,
     lookback_start: str | None = None,
+    parent_name_hints: list[str] | None = None,
 ) -> tuple[list[tuple[str, str, str, list[dict]]], dict[str, Any]]:
     """Oldest→newest running issuer map from Schedule 13D/G amendments.
 
@@ -649,7 +752,8 @@ def collect_13g_period_snapshots(
     the cover "Date of Event Which Requires Filing" (fallback: filing_date), so
     a 13D filed inside the 45-day window after a quarter end sits in the
     quarter its event belongs to. ``meta["exited_by_date"]`` is keyed the same
-    way.
+    way. ``meta["num_self_issuer_filings"]`` counts third-party filings about
+    the parent itself that were skipped.
     """
     _key = holding_key
     from .lookback import date_on_or_after
@@ -657,11 +761,14 @@ def collect_13g_period_snapshots(
     meta: dict[str, Any] = {
         "num_filings": 0,
         "num_periods": 0,
+        "num_self_issuer_filings": 0,
         "error": None,
         "cik": cik,
         "parent_ticker": parent_ticker,
         "lookback_start": lookback_start,
     }
+    if parent_name_hints is None:
+        parent_name_hints = parent_name_hints_for(parent_ticker)
     session = requests.Session()
     session.headers.update({"User-Agent": user_agent or "hidden_stock research"})
     try:
@@ -686,6 +793,11 @@ def collect_13g_period_snapshots(
             parsed = parse_filing_body(body, kind)
         except Exception:
             continue
+        if _is_self_issuer_filing(
+            parsed, parent_ticker=parent_ticker, parent_name_hints=parent_name_hints
+        ):
+            meta["num_self_issuer_filings"] += 1
+            continue
         pos = raw_to_position(
             parsed,
             parent_ticker=parent_ticker,
@@ -693,6 +805,7 @@ def collect_13g_period_snapshots(
             acc=acc,
             filing_date=filing_date,
             cik=cik,
+            parent_name_hints=parent_name_hints,
         )
         if not pos:
             continue
